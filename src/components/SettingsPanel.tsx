@@ -8,10 +8,20 @@ import { getJevKey, setJevKey } from "@/lib/jev";
 interface Props {
   settings: Settings;
   resolvedCodeStrip: Settings["codeStrip"] | null;
+  /** Depreciation allowance (%) applied to displayed statuses (ACV mode). */
+  depreciationPct: number;
+  /** Applies immediately — no re-run needed (display-layer reclassification). */
+  onDepreciationChange: (pct: number) => void;
   onApply: (s: Settings) => void;
 }
 
-export default function SettingsPanel({ settings, resolvedCodeStrip, onApply }: Props) {
+export default function SettingsPanel({
+  settings,
+  resolvedCodeStrip,
+  depreciationPct,
+  onDepreciationChange,
+  onApply,
+}: Props) {
   const [draft, setDraft] = useState<Settings>(settings);
   const [jevKey, setJevKeyState] = useState<string>(() => getJevKey());
   const [jevInput, setJevInput] = useState("");
@@ -76,6 +86,37 @@ export default function SettingsPanel({ settings, resolvedCodeStrip, onApply }: 
               {p === 0 ? "Exact" : `±${p}%`}
             </button>
           ))}
+        </div>
+
+        <div className="rounded-xl bg-slate-50 dark:bg-slate-800/60 p-4">
+          <p className="text-sm font-medium text-slate-700 dark:text-slate-200">
+            Depreciation allowance (ACV mode)
+          </p>
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+            When the adjuster valued items at actual cash value, verified prices
+            sitting below the claim by up to this percentage are expected — they
+            are reclassified to Match with a note instead of Mismatch. Applies
+            instantly, no re-run needed. 0 = off.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-1.5" role="group" aria-label="Depreciation presets">
+            {[0, 5, 10, 15, 20, 30, 50].map((p) => (
+              <button
+                key={p}
+                type="button"
+                onClick={() => onDepreciationChange(p)}
+                className={`rounded-full px-3 py-1 text-xs font-semibold ring-1 transition ${
+                  depreciationPct === p
+                    ? "bg-indigo-600 text-white ring-indigo-600"
+                    : "bg-white text-slate-600 ring-slate-300 hover:bg-slate-50 dark:bg-slate-900 dark:text-slate-300 dark:ring-slate-700 dark:hover:bg-slate-800"
+                }`}
+              >
+                {p === 0 ? "Off" : `−${p}%`}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] text-slate-400">
+            Current: {depreciationPct === 0 ? "off" : `gaps up to −${depreciationPct}% treated as expected`}.
+          </p>
         </div>
 
         <label className="block">

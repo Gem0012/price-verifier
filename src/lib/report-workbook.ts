@@ -70,6 +70,10 @@ const AUDIT_BASE_HEADERS: readonly string[] = [
 export interface QtyMaps {
   aQty: Record<number, number | null>;
   bQty: Record<number, number | null>;
+  /** rowNum -> other rowNums in File A with the same description (duplicates) */
+  aDups?: Record<number, number[]>;
+  /** Every File B row — powers the Adjuster Ledger sheet */
+  bRows?: Record<number, { name: string; price: number | null; qty: number | null }>;
 }
 
 function hasQtyData(qty?: QtyMaps): boolean {
@@ -79,12 +83,17 @@ function hasQtyData(qty?: QtyMaps): boolean {
   );
 }
 
+function hasDupData(qty?: QtyMaps): boolean {
+  return !!qty && Object.keys(qty.aDups ?? {}).length > 0;
+}
+
 /** Headers + 1-based column indices; qty columns slot in before B Price. */
-function buildLayout(hasJev: boolean, hasQty: boolean) {
+function buildLayout(hasJev: boolean, hasQty: boolean, hasDups = false) {
   const headers = [
     ...AUDIT_BASE_HEADERS.slice(0, 7),
     ...(hasQty ? ["Claimed Qty", "Assessed Qty"] : []),
     ...AUDIT_BASE_HEADERS.slice(7),
+    ...(hasDups ? ["Duplicate Rows"] : []),
     ...(hasJev ? ["Jev Verdict"] : []),
     "Notes",
   ];
@@ -97,6 +106,7 @@ function buildLayout(hasJev: boolean, hasQty: boolean) {
     colGap: col("Gap %"),
     colStatus: col("Status"),
     colQty: hasQty ? col("Claimed Qty") : -1,
+    colDup: hasDups ? col("Duplicate Rows") : -1,
   };
 }
 
@@ -118,6 +128,7 @@ function auditRow(
   layout: ReturnType<typeof buildLayout>,
   aQty: Record<number, number | null>,
   bQty: Record<number, number | null>,
+  aDups: Record<number, number[]> = {},
 ): (string | number | null)[] {
   const row: (string | number | null)[] = [
     r.aRowNum,
@@ -139,6 +150,10 @@ function auditRow(
     r.method ?? "",
     STATUS_NAMES[r.status],
   );
+  if (layout.colDup !== -1) {
+    const dups = aDups[r.aRowNum];
+    row.push(dups && dups.length > 0 ? dups.join(", ") : "");
+  }
   if (layout.headers.includes("Jev Verdict")) row.push(jevCell(r));
   row.push(r.notes.join(" | ") || "");
   return row;
@@ -175,10 +190,11 @@ function addTableSheet(
   qty?: QtyMaps,
 ): void {
   const ws = wb.addWorksheet(name);
-  const layout = buildLayout(hasJev, hasQtyData(qty));
+  const layout = buildLayout(hasJev, hasQtyData(qty), hasDupData(qty));
   const headers = layout.headers;
   const aQty = qty?.aQty ?? {};
   const bQty = qty?.bQty ?? {};
+  const aDups = qty?.aDups ?? {};
   ws.columns = headers.map((h) => ({ header: h, key: h, width: 18 }));
   ws.getRow(1).font = HEADER_FONT;
   ws.getRow(1).fill = HEADER_FILL;
@@ -208,7 +224,7 @@ function addTableSheet(
   ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: headers.length } };
 
   for (const r of rows) {
-    const row = ws.addRow(auditRow(r, layout, aQty, bQty));
+    const row = ws.addRow(auditRow(r, layout, aQty, bQty, aDups));
     applyStatusFill(row, r.status, layout.colStatus, layout.colDifference);
   }
 
@@ -482,5 +498,73 @@ export async function buildReportBuffer(
     freezeFirstColumn: false,
   }, qty);
 
+  addAdjusterLedgerSheet(wb, results, qty);
+
   return wb.xlsx.writeBuffer();
+}
+
+/**
+ * Adjuster Ledger sheet: EVERY File B row listed — matched (with the claim
+ * row it supports) or unmatched. Guarantees neither file is dropped from the
+ * report: the claim side is the Full Audit, the adjuster side is this sheet.
+ */
+function addAdjusterLedgerSheet(
+  wb: import("exceljs").Workbook,
+  results: MatchResult[],
+  qty?: QtyMaps,
+): void {
+  const bRows = qty?.bRows ?? {};
+  if (Object.keys(bRows).length === 0) return;
+  const aQty = qty?.aQty ?? {};
+
+  const matchedByB = new Map<number, { aRow: number; aName: string }>();
+  for (const r of results) {
+    if (r.chosen && !matchedByB.has(r.chosen.bRowNum)) {
+      matchedByB.set(r.chosen.bRowNum, { aRow: r.aRowNum, aName: r.aRawName });
+    }
+  }
+
+  const ws = wb.addWorksheet("Adjuster Ledger");
+  const headers = ["B Row", "Description", "Claimed Qty", "Assessed Qty", "Unit Price", "Total Cost", "Status", "Supports Claim Row", "Matched A Item"];
+  ws.columns = headers.map((h) => ({ header: h, key: h, width: 18 }));
+  ws.getRow(1).font = HEADER_FONT;
+  ws.getRow(1).fill = HEADER_FILL;
+  ws.views = [{ state: "frozen", ySplit: 1 }];
+  ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: headers.length } };
+  ws.getColumn(2).width = 46;
+  ws.getColumn("Unit Price").numFmt = MONEY_FMT;
+  ws.getColumn("Total Cost").numFmt = MONEY_FMT;
+  ws.getColumn("Claimed Qty").numFmt = "#,##0.##";
+  ws.getColumn("Assessed Qty").numFmt = "#,##0.##";
+
+  for (const [numStr, row] of Object.entries(bRows)) {
+    const rowNum = Number(numStr);
+    const m = matchedByB.get(rowNum);
+    const aRowNum = m?.aRow ?? null;
+    const aItem = results.find((r) => r.aRowNum === aRowNum);
+    const claimedQty = aRowNum !== null ? (aQty[aRowNum] ?? null) : null;
+    const ext = row.qty != null && row.price != null
+      ? Math.round(row.qty * row.price * 100) / 100
+      : row.price;
+    const r = ws.addRow([
+      rowNum,
+      row.name,
+      claimedQty,
+      row.qty ?? null,
+      row.price,
+      ext,
+      m ? `Matched → A${m.aRow}` : "Unmatched",
+      aRowNum,
+      m ? m.aName : "",
+    ]);
+    const statusCell = r.getCell("Status");
+    statusCell.font = m
+      ? { color: { argb: "FF006100" }, bold: true }
+      : { color: { argb: "FF9C6500" }, bold: true };
+    statusCell.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: m ? "FFC6EFCE" : "FFFFEB9C" },
+    };
+  }
 }

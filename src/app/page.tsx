@@ -13,6 +13,12 @@ import type { JevDecision, JevPair } from "@/lib/jev";
 import { runMatchingParallel, type ParallelRunHandle } from "@/lib/runParallel";
 import ThemeToggle from "@/components/ThemeToggle";
 import { cleanPrice } from "@/lib/normalize";
+import {
+  applyDepreciationAllowance,
+  buildADuplicates,
+  buildRowData,
+  type AnalysisExtras,
+} from "@/lib/analysis";
 
 /** Label keywords that suggest a quantity column. */
 const QTY_LABEL = /qty|quantity|pcs|pieces|units|sacks|boxes|dozen/i;
@@ -36,6 +42,9 @@ export default function Home() {
   const [fileNames, setFileNames] = useState<{ a: string; b: string } | null>(null);
   const [aQty, setAQty] = useState<Record<number, number | null>>({});
   const [bQty, setBQty] = useState<Record<number, number | null>>({});
+  const [aDups, setADups] = useState<Record<number, number[]>>({});
+  const [bRowData, setBRowData] = useState<AnalysisExtras["bRows"]>({});
+  const [depreciationPct, setDepreciationPct] = useState(0);
   const [runError, setRunError] = useState<string | null>(null);
   const runRef = useRef<ParallelRunHandle | null>(null);
 
@@ -155,6 +164,16 @@ export default function Home() {
     setFileNames({ a: sideA.parsed.fileName, b: sideB.parsed.fileName });
     setAQty(buildQtyMap(sideA.parsed, sideA.sheetIdx, sideA.headerRow, sideA.qtyCol));
     setBQty(buildQtyMap(sideB.parsed, sideB.sheetIdx, sideB.headerRow, sideB.qtyCol));
+    setADups(buildADuplicates(sideA.parsed.sheets[sideA.sheetIdx]?.rows ?? [], sideA.headerRow, sideA.nameCol));
+    setBRowData(
+      buildRowData(
+        sideB.parsed.sheets[sideB.sheetIdx]?.rows ?? [],
+        sideB.headerRow,
+        sideB.nameCol,
+        sideB.priceCol,
+        sideB.qtyCol,
+      ),
+    );
     setStage("running");
     setProgress({ done: 0, total: aRows.length });
 
@@ -166,7 +185,7 @@ export default function Home() {
         runSettings,
         (done, total) => setProgress({ done, total }),
         (results, parallelStats) => {
-          setResults(results);
+          setResults(applyDepreciationAllowance(results, depreciationPct));
           setStats(parallelStats);
           runRef.current = null;
           setStage("results");
@@ -178,13 +197,13 @@ export default function Home() {
         },
       );
     },
-    [sideA, sideB, settings],
+    [sideA, sideB, settings, depreciationPct],
   );
 
   const handlePick = useCallback(
     (id: number, c: Candidate) => {
-      setResults((rs) =>
-        rs?.map((r) => {
+      setResults((rs) => {
+        const mapped = rs?.map((r) => {
           if (r.id !== id) return r;
           const difference =
             c.price !== null && r.aPrice !== null
@@ -211,10 +230,20 @@ export default function Home() {
               `Manually picked File B row ${c.bRowNum}.`,
             ],
           };
-        }) ?? rs,
-      );
+        });
+        return mapped ? applyDepreciationAllowance(mapped, depreciationPct) : null;
+      });
     },
-    [settings.priceTolerance],
+    [settings.priceTolerance, depreciationPct],
+  );
+
+  /** Re-apply the depreciation allowance when the setting changes — no re-run needed. */
+  const handleDepreciationChange = useCallback(
+    (pct: number) => {
+      setDepreciationPct(pct);
+      setResults((rs) => (rs ? applyDepreciationAllowance(rs, pct) : rs));
+    },
+    [],
   );
 
   /**
@@ -236,7 +265,7 @@ export default function Home() {
       const pairById = new Map(pairs.map((p) => [p.id, p]));
       setResults((rs) => {
         if (!rs) return rs;
-        return rs.map((r) => {
+        const mapped = rs.map((r) => {
           const d = byId.get(r.id);
           if (!d || r.status !== "NEEDS_REVIEW") return r;
           // Replace any previous Jev note so re-screening doesn't duplicate them.
@@ -307,9 +336,10 @@ export default function Home() {
             ],
           };
         });
+        return applyDepreciationAllowance(mapped, depreciationPct);
       });
     },
-    [settings.priceTolerance],
+    [settings.priceTolerance, depreciationPct],
   );
 
   function startOver() {
@@ -407,6 +437,10 @@ export default function Home() {
             fileNames={fileNames}
             aQty={aQty}
             bQty={bQty}
+            aDups={aDups}
+            bRowData={bRowData}
+            depreciationPct={depreciationPct}
+            onDepreciationChange={handleDepreciationChange}
             busy={false}
             onSettingsChange={setSettings}
             onRerun={handleRun}

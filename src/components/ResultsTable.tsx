@@ -41,6 +41,7 @@ interface Props {
   problemsOnly?: boolean;
   aQty?: Record<number, number | null>;
   bQty?: Record<number, number | null>;
+  aDups?: Record<number, number[]>;
   onOpen: (id: number) => void;
 }
 
@@ -49,9 +50,11 @@ export default function ResultsTable({
   problemsOnly,
   aQty = {},
   bQty = {},
+  aDups = {},
   onOpen,
 }: Props) {
   const hasQty = Object.keys(aQty).length > 0 || Object.keys(bQty).length > 0;
+  const hasDups = Object.keys(aDups).length > 0;
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<Status | "all">("all");
   const [sortKey, setSortKey] = useState<SortKey>(problemsOnly ? "status" : "row");
@@ -266,8 +269,18 @@ export default function ResultsTable({
               >
                 <td className="px-3 py-2 text-xs text-slate-400 dark:text-slate-500">{r.aRowNum}</td>
                 <td className="max-w-[26rem] px-3 py-2">
-                  <div className="truncate font-medium text-slate-800 dark:text-slate-100" title={r.aRawName}>
-                    {r.aRawName}
+                  <div className="flex items-center gap-1.5">
+                    <span className="truncate font-medium text-slate-800 dark:text-slate-100" title={r.aRawName}>
+                      {r.aRawName}
+                    </span>
+                    {hasDups && aDups[r.aRowNum] && (
+                      <span
+                        className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
+                        title={`Same description as File A row(s): ${aDups[r.aRowNum].join(", ")} — possible duplicate claim line`}
+                      >
+                        DUP
+                      </span>
+                    )}
                   </div>
                   {r.chosen ? (
                     <div

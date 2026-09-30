@@ -7,6 +7,7 @@ import ResultsTable from "./ResultsTable";
 import ItemDetailModal from "./ItemDetailModal";
 import SettingsPanel from "./SettingsPanel";
 import PriceSummary from "./PriceSummary";
+import AdjusterLedger from "./AdjusterLedger";
 import { STATUS_NAMES } from "./StatusPill";
 import { downloadReport } from "@/lib/export";
 import { getJevKey, screenNeedsReview } from "@/lib/jev";
@@ -21,6 +22,13 @@ interface Props {
   fileNames: { a: string; b: string } | null;
   aQty: Record<number, number | null>;
   bQty: Record<number, number | null>;
+  /** rowNum -> other rowNums in File A sharing the same description (double-dipping flag) */
+  aDups: Record<number, number[]>;
+  /** All File B rows keyed by rowNum — powers the reverse-coverage report */
+  bRowData: Record<number, { name: string; price: number | null; qty: number | null }>;
+  /** Depreciation allowance (%) currently applied to displayed statuses */
+  depreciationPct: number;
+  onDepreciationChange: (pct: number) => void;
   busy: boolean;
   onSettingsChange: (s: Settings) => void;
   onRerun: (override?: Settings) => void;
@@ -29,10 +37,11 @@ interface Props {
   onBack: () => void;
 }
 
-type Tab = "audit" | "action" | "summary" | "settings";
+type Tab = "audit" | "ledger" | "action" | "summary" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: "audit", label: "Full Audit" },
+  { id: "audit", label: "Claim Audit" },
+  { id: "ledger", label: "Adjuster Ledger" },
   { id: "action", label: "Action List" },
   { id: "summary", label: "Price Summary" },
   { id: "settings", label: "Settings" },
@@ -45,6 +54,10 @@ export default function Dashboard({
   fileNames,
   aQty,
   bQty,
+  aDups,
+  bRowData,
+  depreciationPct,
+  onDepreciationChange,
   busy,
   onSettingsChange,
   onRerun,
@@ -135,7 +148,12 @@ export default function Dashboard({
         NEEDS_REVIEW: liveCounts.NEEDS_REVIEW,
         NOT_FOUND: liveCounts.NOT_FOUND,
       };
-      await downloadReport(results, liveStats, settings, fileNames, { aQty, bQty });
+      await downloadReport(results, liveStats, settings, fileNames, {
+        aQty,
+        bQty,
+        aDups,
+        bRows: bRowData,
+      });
     } catch (err) {
       setExportError(`Export failed: ${(err as Error).message}`);
     } finally {
@@ -235,8 +253,15 @@ export default function Dashboard({
       )}
 
       {tab === "audit" && (
-        <ResultsTable results={results} aQty={aQty} bQty={bQty} onOpen={setDetailId} />
+        <ResultsTable
+          results={results}
+          aQty={aQty}
+          bQty={bQty}
+          aDups={aDups}
+          onOpen={setDetailId}
+        />
       )}
+      {tab === "ledger" && <AdjusterLedger bRowData={bRowData} results={results} />}
       {tab === "action" && (
         <>
           {needsReviewPairs.length > 0 && (
@@ -268,6 +293,7 @@ export default function Dashboard({
             problemsOnly
             aQty={aQty}
             bQty={bQty}
+            aDups={aDups}
             onOpen={setDetailId}
           />
         </>
@@ -278,12 +304,16 @@ export default function Dashboard({
           tolerancePct={settings.priceTolerance}
           aQty={aQty}
           bQty={bQty}
+          aDups={aDups}
+          bRowData={bRowData}
         />
       )}
       {tab === "settings" && (
         <SettingsPanel
           settings={settings}
           resolvedCodeStrip={stats.resolvedCodeStrip}
+          depreciationPct={depreciationPct}
+          onDepreciationChange={onDepreciationChange}
           onApply={(s) => {
             // Pass the new settings directly — calling onRerun() without them
             // would run with the pre-update closure's stale thresholds.
