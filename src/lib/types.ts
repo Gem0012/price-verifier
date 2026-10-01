@@ -1,19 +1,19 @@
 export type Status =
-  | "MATCH"
-  | "MISMATCH"
-  | "MULTIPLE"
-  | "NEEDS_REVIEW"
-  | "NOT_FOUND";
+  | "CONFIRMED"
+  | "STRONG"
+  | "PROBABLE"
+  | "CONFLICT"
+  | "UNMATCHED";
 
 export const STATUS_LABELS: Record<Status, string> = {
-  MATCH: "Match",
-  MISMATCH: "Mismatch",
-  MULTIPLE: "Multiple matches",
-  NEEDS_REVIEW: "Needs review",
-  NOT_FOUND: "Not found",
+  CONFIRMED: "Confirmed match",
+  STRONG: "Strong match",
+  PROBABLE: "Probable match",
+  CONFLICT: "Conflict",
+  UNMATCHED: "Unmatched",
 };
 
-export type MatchMethod = "exact" | "fuzzy" | "manual" | "jev" | null;
+export type MatchMethod = "code" | "exact" | "fuzzy" | "manual" | "jev" | null;
 
 export type JevVerdict = "MATCH" | "NOT_MATCH" | "UNCERTAIN";
 
@@ -24,6 +24,8 @@ export interface Candidate {
   rawPrice: unknown;
   price: number | null;
   similarity: number;
+  /** Part/model code that linked this candidate to the row (code-matched only). */
+  matchedCode?: string | null;
 }
 
 export interface MatchResult {
@@ -33,6 +35,8 @@ export interface MatchResult {
   aCleaned: string;
   aRawPrice: unknown;
   aPrice: number | null;
+  /** Part/model codes extracted from the File A description (and code column). */
+  aCodes: string[];
   status: Status;
   method: MatchMethod;
   score: number | null;
@@ -50,6 +54,8 @@ export interface ColumnMapping {
   headerRow: number;
   nameCol: number;
   priceCol: number;
+  /** Auto-detected part/model/SKU code column, when one exists. */
+  codeCol: number | null;
 }
 
 export interface SheetColumn {
@@ -82,17 +88,18 @@ export interface CodeStripConfig {
 }
 
 export interface Settings {
-  /** similarity (0-100) at or above which a fuzzy candidate is auto-accepted */
-  autoAccept: number;
-  /** similarity (0-100) below which (except for the single best candidate) matches are not kept */
+  /**
+   * Fuzzy scores at or above this are kept as Probable-match candidates for
+   * review. Fuzzy matching NEVER auto-accepts — it only suggests (identity is
+   * decided by part numbers, exact descriptions, or a human).
+   */
   reviewFloor: number;
-  /** |A price - B price| <= (tolerance% of the A price) counts as MATCH */
+  /** |A price − B price| shown as the gap for the chosen reference record. */
   priceTolerance: number;
   codeStrip: CodeStripConfig;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  autoAccept: 90,
   reviewFloor: 60,
   priceTolerance: 0,
   codeStrip: { mode: "auto" },

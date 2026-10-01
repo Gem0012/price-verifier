@@ -18,8 +18,10 @@ import path from "node:path";
 const OUT_DIR = "C:/Files-2.1";
 const A_TARGET = 5000;
 const B_TARGET = 20000;
-const NOT_FOUND_TARGET = 120;
-const MULTIPLE_TARGET = 160;
+const UNMATCHED_TARGET = 120;
+const CONFIRMED_TARGET = 400; // items with an embedded part code + matching B Part No.
+const CONFLICT_TARGET = 120; // code matches a costing row describing a different product
+const DUP_TARGET = 160; // items with a second B record (nothing is locked)
 const SEED = 20260929;
 
 // ---------------------------------------------------------------------------
@@ -315,11 +317,11 @@ function crossMaxSim(variantCleaned, selfIdx) {
 let codeNum = 1;
 const nextCode = () => `ITM-${String(codeNum++).padStart(5, "0")}`;
 
-// Exclusive items → NOT_FOUND (no B row will share any of their tokens).
+// Exclusive items → UNMATCHED (no B row will share any of their tokens).
 for (const fam of EXCLUSIVE) {
   const combos = [];
   for (const b of fam.brands) for (const s of fam.specs) combos.push([b, s]);
-  const chosen = shuffle(combos).slice(0, NOT_FOUND_TARGET / EXCLUSIVE.length);
+  const chosen = shuffle(combos).slice(0, UNMATCHED_TARGET / EXCLUSIVE.length);
   for (const [brand, spec] of chosen) {
     const groups = [fam.family.split(" "), brand.split(" "), spec.split(" ")];
     const desc = groups.map((g) => g.join(" ")).join(" ");
@@ -334,17 +336,15 @@ for (const fam of EXCLUSIVE) {
       price: round2(fam.price[0] + rng() * (fam.price[1] - fam.price[0])),
       category: fam.family,
       variant: null,
-      intended: "NOT_FOUND",
+      intended: "UNMATCHED",
       dupRow: null,
     });
   }
 }
 
-// Regular items — greedy combo pick with min 2-group difference within family
-// and <85 similarity vs any existing description sharing >=2 tokens (keeps A
-// items distinct so one item's B rows cannot near-tie with another item's).
-const perFamilyTarget = Math.floor((A_TARGET - NOT_FOUND_TARGET) / REGULAR.length); // 406
-const leftover = A_TARGET - NOT_FOUND_TARGET - perFamilyTarget * REGULAR.length; // 8
+// per-family target for regular items
+const perFamilyTarget = Math.floor((A_TARGET - UNMATCHED_TARGET) / REGULAR.length); // 406
+const leftover = A_TARGET - UNMATCHED_TARGET - perFamilyTarget * REGULAR.length; // 8
 
 REGULAR.forEach((fam, famIdx) => {
   const target = perFamilyTarget + (famIdx < leftover ? 1 : 0);
@@ -494,10 +494,14 @@ for (const i of regularIdx) {
   if (!best) best = unsafeBest; // last resort: least-harmful row, intend its real bucket
   if (!best) throw new Error(`no variant for item ${i}`);
   it.variant = best;
-  if (best.cls === "hard" || best.cls === "below") it.intended = "NEEDS_REVIEW";
+  if (best.cls === "hard" || best.cls === "below") it.intended = "PROBABLE";
 }
 
-// Price rolls: same / different / messy-but-parseable / unreadable.
+// Price rolls: same / different (valuation evidence, not identity) / unreadable.
+// A price gap never changes the status any more — the flag `gapPrice` only
+// makes the B price differ so the valuation layer has an above/below-range
+// population to show. Under the identity model, ONLY an exact normalized
+// description earns STRONG; anything fuzzy is PROBABLE by design.
 const blankAPrice = new Set();
 {
   const eligible = regularIdx.filter((i) => aItems[i].intended === null);
@@ -505,31 +509,97 @@ const blankAPrice = new Set();
   for (const i of eligible) {
     const it = aItems[i];
     const r = rng();
-    it.intended = r < 0.8 ? "MATCH" : r < 0.95 ? "MISMATCH" : "MATCH";
-    if (blanksLeft > 0 && it.intended === "MATCH" && chance(0.004)) {
+    it.intended = it.variant?.cls === "exact" ? "STRONG" : "PROBABLE";
+    it.gapPrice = r >= 0.8; // ~20% carry a different (explained-later) price
+    if (blanksLeft > 0 && chance(0.004)) {
       blankAPrice.add(i);
       blanksLeft--;
-      it.intended = "NEEDS_REVIEW";
     }
   }
 }
 
-// Duplicates → MULTIPLE (exact-class items only, so both rows normalize alike).
+// Part-code subset → CONFIRMED: codes embedded in the A description (the real
+// Ending Inventory carries codes inside the text) and mirrored in the B
+// "Part No." column (the real Costing file's strongest identity signal).
+{
+  const pool = regularIdx.filter(
+    (i) => aItems[i].intended === "STRONG" && !blankAPrice.has(i),
+  );
+  const chosen = shuffle(pool).slice(0, CONFIRMED_TARGET);
+  let pn = 1000;
+  for (const i of chosen) {
+    const it = aItems[i];
+    const style = rand(3);
+    const raw =
+      style === 0
+        ? `A-${pn}`
+        : style === 1
+          ? `KBJ-${pn}`
+          : `${1 + rand(4)}${String(pn).padStart(5, "0")}-0L${rand(10)}${rand(10)}`;
+    it.partCode = raw;
+    it.desc = `${it.desc} ${raw}`; // append keeps the answer-key containment check valid
+    it.cleaned = normalizeDescription(it.desc);
+    it.intended = "CONFIRMED";
+    pn += 1 + rand(9);
+  }
+}
+
+// CONFLICT cases: the part number matches but the costing row describes a
+// DIFFERENT product (the expert's 23390-0L070 = "Fuel Filter, Hi-Lux/Innova"
+// vs inventory "AIR FILTER 23390-0L070"). These items get a private code whose
+// only costing row is a wholly unrelated automotive part — word overlap is zero,
+// so the engine must report CONFLICT and accept nothing.
+const CONFLICT_DESCS = [
+  "Windshield Washer Pump",
+  "Heads-Up Display Unit",
+  "Seat Belt Tensioner",
+  "Sunroof Drain Tube",
+  "Vapor Canister Valve",
+  "Cabin Blower Motor",
+];
+{
+  const pool = shuffle(
+    regularIdx.filter(
+      (i) =>
+        aItems[i].intended === "PROBABLE" &&
+        !blankAPrice.has(i) &&
+        !aItems[i].partCode &&
+        !aItems[i].dupRow,
+    ),
+  );
+  let cn = 700;
+  for (const i of pool.slice(0, CONFLICT_TARGET)) {
+    const it = aItems[i];
+    it.conflictCode = `K${cn}`;
+    it.conflictDesc = CONFLICT_DESCS[cn % CONFLICT_DESCS.length];
+    it.desc = `${it.desc} ${it.conflictCode}`;
+    it.cleaned = normalizeDescription(it.desc);
+    it.intended = "CONFLICT";
+    cn += 1;
+  }
+}
+
+// Duplicates: a second B record for the same identity (collect-all — no
+// picking, no locking; both records feed the item's valuation range).
 {
   const exactIdx = shuffle(
-    regularIdx.filter((i) => aItems[i].variant?.cls === "exact" && !blankAPrice.has(i)),
+    regularIdx.filter(
+      (i) =>
+        aItems[i].variant?.cls === "exact" &&
+        !blankAPrice.has(i) &&
+        (aItems[i].intended === "STRONG" || aItems[i].intended === "CONFIRMED"),
+    ),
   );
-  for (const i of exactIdx.slice(0, MULTIPLE_TARGET)) {
-    aItems[i].intended = "MULTIPLE";
+  for (const i of exactIdx.slice(0, DUP_TARGET)) {
     aItems[i].dupRow = { raw: renderRaw(T.verbatim(aItems[i].groups)), price: null };
   }
 }
 
 // ---------------------------------------------------------------------------
 // Assemble File B rows.
-const bRows = []; // {raw, priceRaw, sourceAIdx|null}
+const bRows = []; // {raw, priceRaw, sourceAIdx|null, partCode|null}
 function priceForAItem(it) {
-  if (it.intended === "MISMATCH") {
+  if (it.gapPrice) {
     const pct = 5 + rand(41);
     return round2(chance(0.5) ? it.price * (1 + pct / 100) : it.price * (1 - pct / 100));
   }
@@ -537,18 +607,32 @@ function priceForAItem(it) {
 }
 for (const i of regularIdx) {
   const it = aItems[i];
-  if (it.intended === "MULTIPLE") {
-    bRows.push({ raw: it.variant.raw, priceRaw: it.price, sourceAIdx: i });
+  // Conflict items get exactly one costing row carrying their private part
+  // number but describing an unrelated product — the classic mis-keyed part.
+  if (it.conflictCode) {
+    bRows.push({
+      raw: renderRaw([it.conflictDesc.split(" ")]),
+      priceRaw: chance(0.25) ? 0 : round2(it.price * (0.8 + rng() * 0.6)),
+      sourceAIdx: i,
+      partCode: it.conflictCode,
+    });
+    continue;
+  }
+  const partCode = it.partCode ?? null;
+  if (it.dupRow) {
+    bRows.push({ raw: it.variant.raw, priceRaw: it.price, sourceAIdx: i, partCode });
     const dupPrice = chance(0.5) ? it.price : round2(it.price * 1.12);
     it.dupRow.price = dupPrice;
-    bRows.push({ raw: it.dupRow.raw, priceRaw: dupPrice, sourceAIdx: i });
+    bRows.push({ raw: it.dupRow.raw, priceRaw: dupPrice, sourceAIdx: i, partCode });
   } else {
     const p = priceForAItem(it);
     let priceRaw = p;
-    if (it.intended === "NEEDS_REVIEW" && !["hard", "below"].includes(it.variant.cls)) {
+    if (it.intended === "PROBABLE" && blankAPrice.has(i)) {
       priceRaw = pick(["N/A", "TBA", ""]); // unreadable B price
+    } else if (chance(0.10)) {
+      priceRaw = 0; // zero-price costing lines (the real Costing file has ~43%)
     } else if (chance(0.06)) priceRaw = messyPrice(p);
-    bRows.push({ raw: it.variant.raw, priceRaw, sourceAIdx: i });
+    bRows.push({ raw: it.variant.raw, priceRaw, sourceAIdx: i, partCode });
   }
 }
 
@@ -582,8 +666,17 @@ for (const i of regularIdx) {
     if (madeFam < famDecoyTarget) throw new Error(`decoys short for ${fam.category}: ${madeFam}/${famDecoyTarget}`);
   });
   console.log(`decoys generated: ${made.length} (needed ${need})`);
+  let dn = 50000;
   for (const d of made) {
-    bRows.push({ raw: renderRaw(d.combo), priceRaw: round2(10 + rng() * 2000), sourceAIdx: null });
+    // Decoys can carry Part No. values too (the real Costing file does), but
+    // from a disjoint ZZ- pool so they never confirm against the masterlist.
+    const partCode = chance(0.6) ? `ZZ-${dn++}` : null;
+    bRows.push({
+      raw: renderRaw(d.combo),
+      priceRaw: chance(0.12) ? 0 : round2(10 + rng() * 2000),
+      sourceAIdx: null,
+      partCode,
+    });
   }
 }
 
@@ -596,9 +689,9 @@ bShuffled.forEach((r, i) => { r.rowNum = i + 2; });
 const bCleanedTokens = new Set();
 for (const r of bShuffled) for (const t of tokensOf(normalizeDescription(r.raw))) bCleanedTokens.add(t);
 for (const it of aItems) {
-  if (it.intended !== "NOT_FOUND") continue;
+  if (it.intended !== "UNMATCHED") continue;
   for (const t of tokensOf(it.cleaned)) {
-    if (bCleanedTokens.has(t)) throw new Error(`NOT_FOUND item token leaked into B: ${it.desc} [${t}]`);
+    if (bCleanedTokens.has(t)) throw new Error(`UNMATCHED item token leaked into B: ${it.desc} [${t}]`);
   }
 }
 
@@ -613,17 +706,17 @@ const engine = runMatching(
     rawName: aNames[i],
     rawPrice: blankAPrice.has(i) ? null : it.price,
   })),
-  bShuffled.map((r) => ({ rowNum: r.rowNum, rawName: r.raw, rawPrice: r.priceRaw })),
+  bShuffled.map((r) => ({ rowNum: r.rowNum, rawName: r.raw, rawPrice: r.priceRaw, rawCode: r.partCode })),
   DEFAULT_SETTINGS,
 );
 console.log(`engine run: ${Date.now() - t0}ms`);
 console.log("status distribution:", engine.stats);
 
 // Confusion matrix: intended vs actual.
-const statuses = ["MATCH", "MISMATCH", "MULTIPLE", "NEEDS_REVIEW", "NOT_FOUND"];
+const statuses = ["CONFIRMED", "STRONG", "PROBABLE", "CONFLICT", "UNMATCHED"];
 const confusion = Object.fromEntries(statuses.map((s) => [s, Object.fromEntries(statuses.map((t) => [t, 0]))]));
 aItems.forEach((it, i) => {
-  confusion[it.intended ?? "MATCH"][engine.results[i].status]++;
+  confusion[it.intended ?? "STRONG"][engine.results[i].status]++;
 });
 console.log("confusion (row = intended, col = actual):");
 for (const s of statuses)
@@ -631,9 +724,9 @@ for (const s of statuses)
 
 // Show the handful of items whose actual status escaped the intended bucket.
 aItems.forEach((it, i) => {
-  const intended = it.intended ?? "MATCH";
+  const intended = it.intended ?? "STRONG";
   const actual = engine.results[i].status;
-  if ((intended === "NEEDS_REVIEW" || intended === "NOT_FOUND") !== (actual === "NEEDS_REVIEW" || actual === "NOT_FOUND") || (intended === "MATCH" && actual === "NOT_FOUND")) {
+  if (intended !== actual) {
     console.log(
       `anomaly: "${it.desc}" intended=${intended} actual=${actual} variant=${it.variant?.name}/${it.variant?.cls}/sim${it.variant?.sim}`,
     );
@@ -641,15 +734,18 @@ aItems.forEach((it, i) => {
 });
 
 // ---------------------------------------------------------------------------
-// Write the two workbooks + answer key.
+// Write the two workbooks + answer key. Layout mirrors the REAL files: the
+// Ending Inventory declares a blank "Product / Inventory Code" and an all-zero
+// "Code" column (identity must come from the descriptions), while the Costing
+// file carries a populated "Part No." column.
 fs.mkdirSync(OUT_DIR, { recursive: true });
-const aAoa = [["Item Name", "Category", "Unit Price"]];
+const aAoa = [["Item Name", "Product / Inventory Code", "Code", "Category", "Unit Price"]];
 aItems.forEach((it, i) => {
   const priceRaw = blankAPrice.has(i) ? null : chance(0.05) ? messyPrice(it.price) : it.price;
-  aAoa.push([`${it.code} ${it.desc}`, it.category, priceRaw]);
+  aAoa.push([`${it.code} ${it.desc}`, null, 0, it.category, priceRaw]);
 });
-const bAoa = [["Description", "Qty", "Unit Price"]];
-for (const r of bShuffled) bAoa.push([r.raw, 1 + rand(50), r.priceRaw === "" ? null : r.priceRaw]);
+const bAoa = [["Description", "Part No.", "Qty", "Unit Price"]];
+for (const r of bShuffled) bAoa.push([r.raw, r.partCode ?? null, 1 + rand(50), r.priceRaw === "" ? null : r.priceRaw]);
 
 const wbA = XLSX.utils.book_new();
 XLSX.utils.book_append_sheet(wbA, XLSX.utils.aoa_to_sheet(aAoa), "Masterlist");
@@ -669,9 +765,12 @@ const key = {
       aRowNum: i + 2,
       code: it.code,
       name: it.desc,
+      partCode: it.partCode ?? null,
       aPrice: it.price,
-      intended: it.intended ?? "MATCH",
+      intended: it.intended ?? "STRONG",
       actual: res.status,
+      aCodes: res.aCodes,
+      candidateCount: res.candidates.length,
       bRowNum: res.chosen?.bRowNum ?? null,
       bName: res.chosen?.rawName ?? null,
       bPrice: res.chosen?.price ?? null,
@@ -694,8 +793,12 @@ for (const [file, sheetName] of [
   const analyzed = analyzeSheet({ name: sheetName, rows });
   const nameCol = analyzed.columns.find((c) => c.index === analyzed.mapping.nameCol);
   const priceCol = analyzed.columns.find((c) => c.index === analyzed.mapping.priceCol);
+  const codeCol =
+    analyzed.mapping.codeCol === null
+      ? "(none)"
+      : analyzed.columns.find((c) => c.index === analyzed.mapping.codeCol).label;
   console.log(
-    `${file}: headerRow=${analyzed.headerRow} name="${nameCol.label}" price="${priceCol.label}" dataRows=${analyzed.dataRowCount}`,
+    `${file}: headerRow=${analyzed.headerRow} name="${nameCol.label}" price="${priceCol.label}" codeCol=${codeCol} dataRows=${analyzed.dataRowCount}`,
   );
 }
 

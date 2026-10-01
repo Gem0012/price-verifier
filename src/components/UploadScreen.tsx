@@ -13,6 +13,8 @@ export interface SideState {
   nameCol: number;
   priceCol: number;
   qtyCol: number | null;
+  /** Auto-detected part/model/SKU code column (null when none). */
+  codeCol: number | null;
   loading: boolean;
   error: string | null;
 }
@@ -24,6 +26,7 @@ export const EMPTY_SIDE: SideState = {
   nameCol: 0,
   priceCol: 1,
   qtyCol: null,
+  codeCol: null,
   loading: false,
   error: null,
 };
@@ -76,8 +79,8 @@ const STEPS = [
     text: "Pick the sheet, header row, and the name & price columns.",
   },
   {
-    title: "Run comparison",
-    text: "See matches and price differences in seconds.",
+    title: "Run the comparison",
+    text: "Identity first: part numbers, then descriptions. Price is evidence, never the verdict.",
   },
 ];
 
@@ -122,8 +125,8 @@ export default function UploadScreen({
       <div className="grid gap-6 lg:grid-cols-2">
         <FileSideCard
           side="A"
-          title="File A — Masterlist"
-          hint="Source of truth for prices. Item names contain the item code."
+          title="File A — Ending Inventory (claim)"
+          hint="The insured's inventory: item descriptions and claimed unit prices. Part/model codes may be embedded in the description."
           state={sideA}
           analysis={analysisA}
           onFile={onFile}
@@ -132,8 +135,8 @@ export default function UploadScreen({
         />
         <FileSideCard
           side="B"
-          title="File B — Prices to verify"
-          hint="Descriptions only. Same items, possibly worded differently."
+          title="File B — Costing file (prices to verify)"
+          hint="The adjuster's costing records: Part No., description, qty and unit price. Every row is listed in the Adjuster Ledger."
           state={sideB}
           analysis={analysisB}
           onFile={onFile}

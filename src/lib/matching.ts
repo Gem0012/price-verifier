@@ -12,20 +12,28 @@ import {
   stripLeadingCode,
   tokenCounts,
 } from "./normalize.ts";
+import {
+  dimsConflict,
+  extractIdentity,
+  wordOverlap,
+  type Identity,
+} from "./identity.ts";
 
 export interface EngineInputRow {
   rowNum: number;
   rawName: unknown;
   rawPrice: unknown;
+  /** Optional structured part/model code column value (Costing files carry one). */
+  rawCode?: unknown;
 }
 
 export interface EngineStats {
   total: number;
-  MATCH: number;
-  MISMATCH: number;
-  MULTIPLE: number;
-  NEEDS_REVIEW: number;
-  NOT_FOUND: number;
+  CONFIRMED: number;
+  STRONG: number;
+  PROBABLE: number;
+  CONFLICT: number;
+  UNMATCHED: number;
 }
 
 export interface EngineOutput {
@@ -35,18 +43,49 @@ export interface EngineOutput {
 }
 
 const FUZZY_POOL = 400; // max fuzzy candidates scored per A row
-const STORED_CANDIDATES = 10; // candidates kept on each result (all for MULTIPLE)
-const NEAR_TIE_MARGIN = 3; // runner-up within this many points → MULTIPLE, never a silent pick
+const STORED_CANDIDATES = 50; // candidates kept per row; valuation reads this set
+/** Below this word-overlap a code-matched pair is flagged as a description conflict. */
+const CONFLICT_OVERLAP = 0.3;
 
+interface BPrep {
+  rowNum: number;
+  rawName: string;
+  cleaned: string;
+  altCleaned: string | null;
+  rawPrice: unknown;
+  price: number | null;
+  identity: Identity;
+  grams: { stripped: string; grams: number[] };
+  gramSet: Set<number>;
+  tokens: Map<string, number>;
+}
+
+interface AGrams {
+  stripped: string;
+  grams: Set<number>;
+  tokens: Map<string, number>;
+}
+
+/**
+ * Three-layer matching engine (layer 1 — identification only):
+ *
+ *   Stage 0  exact part/model code match   → CONFIRMED (or CONFLICT when the
+ *            descriptions describe different products despite the shared code)
+ *   Stage 1  exact normalized description  → STRONG
+ *   Stage 2  fuzzy suggestion              → PROBABLE (never auto-accepted)
+ *   no evidence at all                     → UNMATCHED
+ *
+ * Fuzzy matching only SUGGESTS candidates; it never decides identity. Price is
+ * NOT an identity criterion — it is recorded as evidence (difference vs the
+ * chosen reference record) for the separate valuation layer.
+ */
 export function runMatching(
   aRows: EngineInputRow[],
   bRows: EngineInputRow[],
   settings: Settings,
   onProgress?: (done: number, total: number) => void,
 ): EngineOutput {
-  const autoAccept = clamp(settings.autoAccept, 50, 100);
-  const reviewFloor = clamp(settings.reviewFloor, 0, autoAccept - 1);
-  const tolerance = Math.max(0, settings.priceTolerance);
+  const reviewFloor = Math.max(0, Math.min(settings.reviewFloor, 99));
 
   const codeCfg =
     settings.codeStrip.mode === "auto"
@@ -54,15 +93,20 @@ export function runMatching(
       : settings.codeStrip;
 
   // ---- Prepare B side ------------------------------------------------------
-  const bPrep = bRows.map((r) => {
+  const bPrep: BPrep[] = bRows.map((r) => {
     const rawName = String(r.rawName ?? "").trim();
+    const cleaned = normalizeDescription(rawName);
     return {
       rowNum: r.rowNum,
       rawName,
-      cleaned: normalizeDescription(rawName),
-      altCleaned: null as string | null,
+      cleaned,
+      altCleaned: null,
       rawPrice: r.rawPrice,
       price: cleanPrice(r.rawPrice),
+      identity: extractIdentity(rawName, r.rawCode),
+      grams: numericGrams(cleaned),
+      gramSet: numericGramSet(cleaned),
+      tokens: tokenCounts(cleaned),
     };
   });
 
@@ -96,6 +140,16 @@ export function runMatching(
     });
   }
 
+  // Part/model code index: normalized code -> B row indices (duplicates kept).
+  const codeIndex = new Map<string, number[]>();
+  bPrep.forEach((b, i) => {
+    for (const code of b.identity.codes) {
+      const arr = codeIndex.get(code);
+      if (arr) arr.push(i);
+      else codeIndex.set(code, [i]);
+    }
+  });
+
   // Inverted index over unique indexed descriptions for the fuzzy stage.
   const uniqueDescs = Array.from(byClean.keys());
   const postings = new Map<string, number[]>();
@@ -123,13 +177,8 @@ export function runMatching(
   const keyTokenCounts = uniqueDescs.map((d) => tokenCounts(d));
 
   // Per-A-row gram sets: computed once per distinct cleaned description.
-  const gramCache = new Map<
-    string,
-    { stripped: string; grams: Set<number>; tokens: Map<string, number> }
-  >();
-  const gramsFor = (
-    s: string,
-  ): { stripped: string; grams: Set<number>; tokens: Map<string, number> } => {
+  const gramCache = new Map<string, AGrams>();
+  const gramsFor = (s: string): AGrams => {
     let g = gramCache.get(s);
     if (!g) {
       g = {
@@ -142,40 +191,35 @@ export function runMatching(
     return g;
   };
 
-  // Fast-path score including the numeric-sibling penalty: identical to
-  // similarity(aCleaned, uniqueDesc) for every input pair.
-  const score = (
-    a: { stripped: string; grams: Set<number>; tokens: Map<string, number> },
-    di: number,
-  ): number => {
+  // Dice + numeric-sibling penalty against a unique-description key.
+  const scoreUnique = (a: AGrams, di: number): number => {
     const base = similarityGramNumbers(a.stripped, a.grams, keyGrams[di]);
     if (base === 100) return 100;
     return Math.max(0, base - numericSiblingPenaltyTokens(a.tokens, keyTokenCounts[di]));
   };
 
-  const makeCandidate = (bi: number, sim: number): Candidate => {
+  // Dice + numeric-sibling penalty against one specific B row (code stage —
+  // small sets, so a dedicated direct comparison is fine).
+  const scoreB = (a: AGrams, bi: number): number => {
     const b = bPrep[bi];
-    return {
-      bRowNum: b.rowNum,
-      rawName: b.rawName,
-      cleaned: b.cleaned,
-      rawPrice: b.rawPrice,
-      price: b.price,
-      similarity: sim,
-    };
+    const base = similarityGramNumbers(a.stripped, a.grams, b.grams);
+    if (base === 100) return 100;
+    return Math.max(0, base - numericSiblingPenaltyTokens(a.tokens, b.tokens));
   };
 
-  // Pool accumulation buffers reused across A rows: identical scores and
-  // identical first-touch order as a Map, without hashing every posting.
+  // Pool accumulation buffers reused across A rows.
   const nKeys = uniqueDescs.length;
   const poolScoreArr = new Float64Array(nKeys);
   const touchedFlag = new Uint8Array(nKeys);
   const touched: number[] = [];
 
-  const fuzzyCandidates = (cleanedA: string): Candidate[] => {
-    const a = gramsFor(cleanedA);
+  // Fuzzy SUGGESTIONS for one cleaned description, best first. May return the
+  // same B row twice when it is indexed under both its full and its
+  // code-stripped key — the caller dedupes.
+  const fuzzyCandidates = (cleanedA: string): { bi: number; sim: number }[] => {
     const tokens = Array.from(new Set(cleanedA.split(" "))).filter(Boolean);
     if (tokens.length === 0) return [];
+    const a = gramsFor(cleanedA);
 
     // Rank unique descriptions by IDF-weighted token overlap, keep a bounded pool.
     for (const t of tokens) {
@@ -192,69 +236,34 @@ export function runMatching(
         }
       }
     }
-    // Stable sort by score: ties keep first-touch order, exactly like sorting
-    // the keys of the old Map. Only the top FUZZY_POOL entries are kept.
     let pool = touched;
     if (touched.length > FUZZY_POOL) {
       pool = touched
         .sort((x, y) => poolScoreArr[y] - poolScoreArr[x])
         .slice(0, FUZZY_POOL);
     }
-    const scored: { di: number; sim: number }[] = [];
+    const scored: { bi: number; sim: number }[] = [];
     for (const di of pool) {
-      const sim = score(a, di);
-      if (sim >= reviewFloor) scored.push({ di, sim });
+      const sim = scoreUnique(a, di);
+      if (sim >= reviewFloor) {
+        for (const bi of byClean.get(uniqueDescs[di])!) scored.push({ bi, sim });
+      }
     }
     for (const di of touched) touchedFlag[di] = 0;
     touched.length = 0;
     scored.sort((x, y) => y.sim - x.sim);
-
-    // Expand each unique description back to all of its B rows. A row can be
-    // reachable via its full and its code-stripped key — keep the better score.
-    const candidates: Candidate[] = [];
-    const seenBi = new Set<number>();
-    for (const { di, sim } of scored) {
-      for (const bi of byClean.get(uniqueDescs[di])!) {
-        if (seenBi.has(bi)) continue;
-        seenBi.add(bi);
-        candidates.push(makeCandidate(bi, sim));
-        if (candidates.length >= STORED_CANDIDATES) return candidates;
-      }
-    }
-    return candidates;
-  };
-
-  // If nothing clears the review floor, keep the single best candidate anyway.
-  const bestBelowFloor = (cleanedA: string): Candidate | null => {
-    const tokens = Array.from(new Set(cleanedA.split(" "))).filter(Boolean);
-    if (tokens.length === 0) return null;
-    const a = gramsFor(cleanedA);
-    let best: Candidate | null = null;
-    const seen = new Set<number>();
-    for (const t of tokens) {
-      const post = postings.get(t);
-      if (!post) continue;
-      for (const di of post) {
-        if (seen.has(di)) continue;
-        seen.add(di);
-        const sim = score(a, di);
-        if (best === null || sim > best.similarity) {
-          best = makeCandidate(byClean.get(uniqueDescs[di])![0], sim);
-        }
-      }
-    }
-    return best;
+    return scored;
   };
 
   // ---- Run over File A -----------------------------------------------------
   const results: MatchResult[] = [];
   const stats: EngineStats = {
     total: aRows.length,
-    MATCH: 0,
-    MISMATCH: 0,
-    MULTIPLE: 0,
-    NEEDS_REVIEW: 0,
-    NOT_FOUND: 0,
+    CONFIRMED: 0,
+    STRONG: 0,
+    PROBABLE: 0,
+    CONFLICT: 0,
+    UNMATCHED: 0,
   };
 
   aRows.forEach((row, idx) => {
@@ -265,85 +274,170 @@ export function runMatching(
 
     let status: Status;
     let method: MatchResult["method"] = null;
-    let score: number | null = null;
+    let scoreVal: number | null = null;
     let chosen: Candidate | null = null;
     let bPrice: number | null = null;
     let difference: number | null = null;
     let candidates: Candidate[] = [];
+    const aIdentity = extractIdentity(aRawName, row.rawCode);
 
     if (!aRawName) {
-      status = "NOT_FOUND";
+      status = "UNMATCHED";
       notes.push("File A row has no item name.");
     } else if (!aCleaned) {
-      status = "NOT_FOUND";
+      status = "UNMATCHED";
       notes.push("Description became empty after removing the item code.");
     } else if (isNonItemDescription(aCleaned)) {
-      status = "NOT_FOUND";
+      status = "UNMATCHED";
       notes.push(
         "Row does not look like an item (a total/footer line or numbers only) — matching skipped.",
       );
     } else {
-      // Stage 1 — exact match on the normalized cleaned description.
-      const exactIdx = byClean.get(aCleaned);
-      if (exactIdx) {
-        candidates = exactIdx.map((bi) => makeCandidate(bi, 100));
-      } else {
-        // Stage 2 — fuzzy match.
-        candidates = fuzzyCandidates(aCleaned);
-        if (
-          candidates.length === 0 ||
-          candidates.every((c) => c.similarity < reviewFloor)
-        ) {
-          const best = bestBelowFloor(aCleaned);
-          candidates = best ? [best] : [];
+      const aGrams = gramsFor(aCleaned);
+      const accepted = new Map<number, Candidate>(); // bIndex -> candidate
+      const conflicts: Candidate[] = []; // code matches with disagreeing descriptions
+      let conflictCount = 0;
+      let codeConfirmed = false;
+
+      // Stage 0 — part/model code matches. Every costing row sharing a code is
+      // collected: compatible rows become accepted evidence; conflicting rows
+      // stay listed but flagged (a shared part number is evidence even when
+      // the wording disagrees — the human decides, nothing is discarded).
+      if (aIdentity.codes.length > 0) {
+        const seen = new Set<number>();
+        for (const code of aIdentity.codes) {
+          for (const bi of codeIndex.get(code) ?? []) {
+            if (seen.has(bi)) continue;
+            seen.add(bi);
+            const b = bPrep[bi];
+            const overlap = wordOverlap(aIdentity.words, b.identity.words);
+            if (overlap < CONFLICT_OVERLAP) {
+              conflictCount++;
+              conflicts.push({
+                bRowNum: b.rowNum,
+                rawName: b.rawName,
+                cleaned: b.cleaned,
+                rawPrice: b.rawPrice,
+                price: b.price,
+                similarity: scoreB(aGrams, bi),
+                matchedCode: code,
+              });
+              notes.push(
+                `Part number ${code} also appears on B${b.rowNum} ("${b.rawName}") but the description conflicts — verify before accepting.`,
+              );
+              continue;
+            }
+            if (dimsConflict(aIdentity.dims, b.identity.dims)) {
+              notes.push(
+                `Part number ${code} matches B${b.rowNum} but dimensions differ (${aIdentity.dims.join(", ")} vs ${b.identity.dims.join(", ")}) — verify size.`,
+              );
+            }
+            codeConfirmed = true;
+            accepted.set(bi, {
+              bRowNum: b.rowNum,
+              rawName: b.rawName,
+              cleaned: b.cleaned,
+              rawPrice: b.rawPrice,
+              price: b.price,
+              similarity: scoreB(aGrams, bi),
+              matchedCode: code,
+            });
+          }
         }
       }
 
-      const top = candidates[0] ?? null;
-      if (!top) {
-        status = "NOT_FOUND";
-      } else if (top.similarity >= autoAccept) {
-        const accepted = candidates.filter((c) => c.similarity >= autoAccept);
-        const nearTie =
-          accepted.length === 1 &&
-          candidates.length > 1 &&
-          top.similarity - candidates[1].similarity <= NEAR_TIE_MARGIN;
-        if (accepted.length > 1 || nearTie) {
-          status = "MULTIPLE";
-          score = top.similarity;
-          notes.push(
-            nearTie
-              ? "Two candidates are too close to call — pick one manually."
-              : `${accepted.length} File B rows match this description — pick one manually.`,
-          );
-        } else {
-          method = top.similarity === 100 ? "exact" : "fuzzy";
-          score = top.similarity;
-          chosen = top;
-          bPrice = top.price;
-          if (aPrice === null) {
-            status = "NEEDS_REVIEW";
-            notes.push("File A price could not be read.");
-          } else if (bPrice === null) {
-            status = "NEEDS_REVIEW";
-            notes.push("File B price could not be read.");
-          } else {
-            difference = round2(bPrice - aPrice);
-            // Tolerance is a percentage of the File A price (0 = exact match).
-            const allowed = (Math.abs(aPrice) * tolerance) / 100;
-            status = Math.abs(difference) <= allowed ? "MATCH" : "MISMATCH";
+      // Stage 1 — exact match on the normalized cleaned description. When an
+      // exact name exists it is strong evidence even if a conflicting code row
+      // was reported above (the conflict note stays).
+      if (accepted.size === 0 && conflicts.length === 0) {
+        const exactIdx = byClean.get(aCleaned);
+        if (exactIdx) {
+          for (const bi of exactIdx) {
+            const b = bPrep[bi];
+            accepted.set(bi, {
+              bRowNum: b.rowNum,
+              rawName: b.rawName,
+              cleaned: b.cleaned,
+              rawPrice: b.rawPrice,
+              price: b.price,
+              similarity: 100,
+              matchedCode: null,
+            });
           }
         }
+      }
+
+      // Stage 2 — fuzzy SUGGESTIONS only. Never auto-accepted: the best the
+      // engine grants on fuzzy evidence alone is PROBABLE (manual review).
+      // Skipped when only conflicting code rows were found — the CONFLICT
+      // verdict must not be papered over by an unrelated fuzzy suggestion.
+      if (accepted.size === 0 && conflicts.length === 0) {
+        for (const { bi, sim } of fuzzyCandidates(aCleaned)) {
+          if (accepted.size >= STORED_CANDIDATES) break;
+          if (accepted.has(bi)) continue;
+          const b = bPrep[bi];
+          accepted.set(bi, {
+            bRowNum: b.rowNum,
+            rawName: b.rawName,
+            cleaned: b.cleaned,
+            rawPrice: b.rawPrice,
+            price: b.price,
+            similarity: sim,
+            matchedCode: null,
+          });
+        }
+      }
+
+      // Candidates: compatible evidence first (best score wins the reference
+      // slot), conflicting rows after — listed for review, never chosen.
+      const acceptedList = [...accepted.values()].sort((x, y) => y.similarity - x.similarity);
+      const conflictList = conflicts.sort((x, y) => y.similarity - x.similarity);
+      candidates = [...acceptedList, ...conflictList];
+      const top = acceptedList[0] ?? null;
+
+      if (acceptedList.length === 0 && conflictCount > 0) {
+        // Every code hit conflicts — flag for the insured, accept nothing.
+        status = "CONFLICT";
+        notes.push(
+          `${conflictCount} costing row${conflictCount === 1 ? "" : "s"} share${
+            conflictCount === 1 ? "s" : ""
+          } this part number but describe a different product — query the insured.`,
+        );
+      } else if (codeConfirmed) {
+        status = "CONFIRMED";
+        method = "code";
+        if (conflictCount > 0) {
+          notes.push(
+            `${conflictCount} further costing row${conflictCount === 1 ? "" : "s"} share${
+              conflictCount === 1 ? "s" : ""
+            } the part number with a conflicting description — see the notes above.`,
+          );
+        }
+        notes.unshift(`Identity by part number: ${aIdentity.codes.join(", ")}.`);
+      } else if (acceptedList.length === 0) {
+        status = "UNMATCHED";
+      } else if (top!.similarity >= 100) {
+        status = "STRONG";
+        method = "exact";
       } else {
-        status = "NEEDS_REVIEW";
-        score = top.similarity;
-        notes.push(`Best similarity ${top.similarity} is below the auto-accept cutoff.`);
+        status = "PROBABLE";
+        method = "fuzzy";
+        notes.push(
+          `Best name similarity ${top!.similarity} — fuzzy evidence only, confirm manually or with Jev.`,
+        );
+      }
+
+      if (status !== "CONFLICT" && status !== "UNMATCHED") {
+        chosen = top;
+        scoreVal = top?.similarity ?? null;
+        bPrice = top?.price ?? null;
+        if (bPrice !== null && aPrice !== null) {
+          difference = round2(bPrice - aPrice);
+        }
       }
     }
 
-    // MULTIPLE keeps every candidate (the spec requires listing them all);
-    // other statuses keep only the top few.
-    if (candidates.length > STORED_CANDIDATES && status !== "MULTIPLE") {
+    if (candidates.length > STORED_CANDIDATES) {
       candidates = candidates.slice(0, STORED_CANDIDATES);
     }
 
@@ -354,9 +448,10 @@ export function runMatching(
       aCleaned,
       aRawPrice: row.rawPrice,
       aPrice,
+      aCodes: aIdentity.codes,
       status,
       method,
-      score,
+      score: scoreVal,
       candidates,
       chosen,
       bPrice,
@@ -373,12 +468,6 @@ export function runMatching(
   });
 
   return { results, stats, resolvedCodeStrip: codeCfg };
-}
-
-function clamp(v: number, min: number, max: number): number {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return min;
-  return Math.min(max, Math.max(min, n));
 }
 
 function round2(n: number): number {

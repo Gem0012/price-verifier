@@ -1,161 +1,248 @@
 # How Price Verifier Works
 
-*A plain-language guide for anyone reviewing a claim — no technical background needed.*
+*A plain-language guide for anyone reviewing a claim. No technical background needed.*
 
 ---
 
 ## The big picture
 
-Two people described the same inventory and each produced their own list:
+Two people went through the same wrecked warehouse and each wrote down their own list:
 
-- **File A — the claim inventory** (what the claimer says was lost and what it's worth)
-- **File B — the adjuster inventory** (what the adjuster counted and valued)
+- **File A — the insured's Ending Inventory.** What the insured says was on the shelves, with the value they are asking for.
+- **File B — the adjuster's Costing file.** What the adjuster counted, and what they say each thing should cost.
 
-Price Verifier lines the two lists up against each other and answers three
-questions for every item:
+Price Verifier puts the two lists side by side and asks **three separate
+questions** about every line. The order matters, and the questions never get
+mixed up:
 
-1. **Is it on both lists?**
-2. **Do the prices agree?**
-3. **Is anything on one list missing from the other?**
+1. **Is it the same thing?** (identity)
+2. **How many?** (quantity)
+3. **What should it cost?** (valuation)
+
+The app refuses to answer the price question until the identity question is
+settled. Comparing prices between two things that aren't the same thing is
+arithmetic, not auditing — and that mistake is the single easiest way to
+manufacture a "finding" that isn't real.
 
 Nothing on either list is ever thrown away. Every row of both files stays
 visible from the moment you upload to the moment you export.
 
 ---
 
-## How the matching works
+## The three layers, explained like you're ten
 
-For every item on the **claim list**, the app reads the **entire adjuster
-list** looking for the same item described differently:
+**Layer 1 — Is it the same thing?**
+Like matching a name tag. "Air filter, part 23390-0L070" and "23390-0L070 —
+Fuel Filter, Hi-Lux" both carry the same part number, but one calls it an air
+filter and the other calls it a fuel filter. Those are **not the same thing**.
+The app notices this and stops, because only a person or the insured can say
+which label is right.
 
-- *"Finishing Nail 2 inch Galvanized"* on one list might be
-  *"2in galv. finish nail"* on the other.
-- CAPITALS, punctuation, and word order are all ignored when comparing.
+**Layer 2 — How many?**
+The quantities on each list. The app adds them up and shows the difference. It
+does not yet test them on its own — see *What it doesn't do yet*.
 
-**Names are matched first. Only after the app decides which two rows are the
-same item does it compare the prices** on that pair. A price check is only
-meaningful once you know you're looking at the same item.
-
-Numbers are treated as identity: a **6202 bearing is not a 6203 bearing**, and
-a **1-gallon can is not a 4-gallon pail**. Similar-looking items with
-different measurements are different products, and the app deliberately
-refuses to auto-match them.
+**Layer 3 — What should it cost?**
+Once an item is identified, the app looks up **every** costing line that refers
+to it — not just the first one — and shows you the whole spread: the cheapest,
+the dearest, and a weighted average. It then tells you where the insured's
+number sits relative to that spread. It does **not** pick a price for you. No
+price is ever accepted automatically.
 
 ---
 
-## The five verdicts a claim item can receive
+## How it decides two items are the same
 
-| Verdict | Plain meaning | What happens next |
+Three attempts, tried in order. The first one that finds something wins.
+
+**Attempt 1 — the part number.**
+Most real parts carry a maker's code: `23390-0L070`, `A-1022`, `KBJ-1202`,
+`208-54109`. The app reads these codes out of the description text *and* out of
+a separate "Part No. / SKU / Code" column when your file has one. It reads
+`A-1022` and `A1022` as the same code, because the dashes and spaces don't
+change what the part is.
+
+Two things it will **not** mistake for a part number:
+
+- **Sizes.** `M8` and `5L` are bolt threads and engine sizes, not part numbers.
+- **Dates.** `2024` in a description is a year, not a code.
+
+And it reads sizes that really do matter: `27x40x6`, `27 × 40 × 6` and `27-40-6`
+are all recognised as the same size, whatever separator somebody typed.
+
+**Attempt 2 — the description, word for word.**
+If there's no shared part number, the app compares the cleaned-up descriptions.
+Capitalisation, punctuation and word order don't count. Auto-parts shorthand is
+translated first, so `FRT` and `Front` are the same word, `ASSY` means
+`assembly`, and `Hi-Lux` and `Hilux` are the same word.
+
+One thing it is careful about: **left and right are never treated as the same
+thing.** `LH` becomes `left` and `RH` becomes `right`, and they stay different
+all the way through. A left-hand brake pad is not a right-hand brake pad.
+
+**Attempt 3 — "these look similar."**
+If nothing matched exactly, the app says "these might be the same" and lists the
+closest names it found. That's all it does. Similar-looking is never treated as
+proof — a person has to say yes before the row counts as identified.
+
+**If none of the three find anything:** the row is **Unmatched**. It stays on
+the list, flagged, waiting for someone.
+
+---
+
+## The five labels a claim line can get
+
+| Label | What it means in plain words | What happens next |
 |---|---|---|
-| **Match** | Same item on both lists **and** the prices agree (within your tolerance) | Nothing — healthy line |
-| **Mismatch** | Same item, but the prices **disagree** | This is a finding — the heart of the audit |
-| **Multiple matches** | Two or more adjuster lines fit this claim item equally well | The app refuses to guess — you pick the right one |
-| **Needs review** | Best candidate is only 60–89% alike — close but not convincing | Jev (the AI) or you confirms "same item?" |
-| **Not found** | Nothing on the adjuster's list shares its words | Possible phantom item — claim lists something the adjuster never saw |
+| **Confirmed** | We found the same part number on both sides | Nothing — it's identified |
+| **Strong** | The descriptions are word-for-word the same after tidying up | Nothing — it's identified |
+| **Probable** | Nothing matched exactly, but a name looks close | A person (or Jev) decides. **Never automatic** |
+| **Conflict** | The part number matches but the descriptions describe different products | **Query the insured** — one of the two labels is wrong |
+| **Unmatched** | Nothing on the other list gives us anything to go on | Possible item the other side never saw. Investigate |
 
-### Worked examples (real scores from the app)
-
-| Claim says | Adjuster says | Score | Verdict | Why |
-|---|---|---|---|---|
-| Common Wire Nail 2 inch Galvanized — **₱50** | common wire nail 2 inch galvanized — **₱72** | 100 | **Mismatch** | Identical name, but ₱72 vs ₱50 is a real price gap — the finding |
-| Oil Filter Toyota | oil filter toyota **hilux** | 91 | **Match** | An extra word is tolerated — clearly the same filter |
-| Ball Bearing 6202 ZZ | 6202 zz ball bearing **SKF** | 86 | **Needs review** | Same part, reordered + brand added — confirm, then it's a match |
-| Finishing Nail 2 inch Galvanized | 2in galv. finish nail | 65 | **Needs review** | Heavily reworded — Jev answers "same item? yes" and it becomes verified |
-| Ball Bearing **6202** ZZ | Ball Bearing **6203** ZZ | 44 | **Not found** | One digit off = a different part. The app pushes this down so it can never false-match |
-| Latex Paint **1 gallon** | White latex paint **4 gallon** | 42 | **Not found** | Same paint, different size = different product |
-| Safety Glove Leather | PVC Pipe 3 inch | 0 | **Not found** | Nothing in common |
-
-A **Needs review** is not a failure — it's the app saying *"human, confirm this
-pair."* Jev screens these in bulk (or you confirm each one); once confirmed,
-the price comparison runs and the row becomes a Match or a Mismatch.
+The first two mean "yes, these are the same item". The third means "here's a
+suggestion, human please". The fourth means "the paperwork contradicts itself".
+The fifth means "we found nothing".
 
 ---
 
-## Multiple matches — the app refuses to guess
+## Worked examples
 
-Claim: **PVC Pipe 3 inch — ₱180**. Adjuster list: *two* identical
-"pvc pipe 3 inch" lines (₱180 and ₱185).
+| The inventory says | The costing file says | Label | Why |
+|---|---|---|---|
+| `BRG 6202 2RS` | `Ball Bearing 6202 2RS` | **Strong** | The part number 6202 is on both sides and the descriptions agree |
+| `AIR FILTER 23390-0L070` | `23390-0L070 Fuel Filter, Hi-Lux/Innova '16` | **Conflict** | Same part number, different product. Ask the insured which one it is |
+| `WIPER BLADE 24"` | `Wiper Blade 24 inch` | **Strong** | Same words once the quote mark becomes "inch" |
+| `OIL FILTER TOYOTA` | `Oil Filter Toyota Hilux` | **Probable** | Very close, but no shared part number — a person confirms it |
+| `Front Brake Pad Set` | `FRT BRK PAD SET` | **Strong** | `FRT` and `Front` mean the same thing |
+| `Brake Pad Set LH` | `Brake Pad Set RH` | **Not the same item** | Left and right stay different, on purpose |
+| `Seal 27x40x6` | `Seal 27-40-6` | **Strong** | Same size, different typing |
+| `Ball Bearing 6202` | `Ball Bearing 6203` | **Not the same item** | One digit apart = a different bearing. It will never quietly pair these |
 
-Both are perfect name matches — so the claim item becomes **Multiple
-matches**, and the app lists every candidate side by side for you to pick.
-Picking wrong would change the finding, so it never picks for you. (In this
-example the pick also reveals that the adjuster listed the same pipe twice.)
+A **Probable** is not a failure. It is the app saying *"please look at this pair."*
+
+---
+
+## The Conflict case, in full
+
+This is the one that matters most, so it is worth spelling out.
+
+The inventory says: `AIR FILTER 23390-0L070`.
+The costing file says: `23390-0L070 — Fuel Filter, Hi-Lux/Innova '16`.
+
+The part numbers are identical. Everything else disagrees. Either the insured
+labelled the item wrongly, or the costing file printed the wrong description
+against a real part number.
+
+The app does not guess, and it does not silently pick the cheaper price. It marks
+the row **Conflict**, keeps both descriptions side by side, and puts it at the
+top of the work list. Your job is to ask the insured which product was actually
+in the warehouse — or to go back to the supplier about the catalogue entry.
+
+---
+
+## What it does with prices
+
+For every item it has identified, the app gathers **all** the costing lines that
+match it, and shows you:
+
+- **How many** costing records it found
+- The **lowest** and **highest** of them
+- A **weighted average** (weighted by quantity when the costing file has
+  quantities, otherwise a plain average)
+
+Nothing is locked to one row. One costing line can support several inventory
+lines, and each of those lines sees the full set.
+
+Lines with **no usable price** (blank, zero, or something unreadable like `TBA`)
+are counted — they are still proof the item exists — but they are **left out of
+the price range**. A missing price is not a cheap price, and treating it as one
+would drag the "cheapest" figure down and invent findings.
+
+Your claimed price is then sorted into one of five positions:
+
+| Position | Meaning |
+|---|---|
+| **In range** | Between the cheapest and the dearest costing record. Fine. |
+| **Above the range** | Higher than every costing record. This is where overpayment exposure comes from. |
+| **Above the range, explained** | Higher than everything, but within the depreciation allowance (see below). Expected, not a finding. |
+| **Below the range** | Cheaper than every costing record. Usually in the insured's favour. |
+| **No usable price** | Nothing to compare against. |
+
+**Overpayment exposure** is the total of "how much more than the dearest costing
+record" across all the rows sitting above the range. It's the headline number in
+the Price Summary — but it is a starting point for a conversation, not a verdict.
+
+---
+
+## Depreciation: when a gap is expected, not suspicious
+
+Adjusters are required to value stock at **actual cash value** — today's
+replacement price minus a deduction for age and condition. So a claim priced at
+replacement cost will legitimately sit above the adjuster's costing by a few or
+twenty percent, every single time, for every single item.
+
+If you set a **depreciation allowance**, the app treats gaps up to that
+percentage as expected and marks them "explained" instead of "potential
+overpayment". They stop counting toward overpayment exposure.
+
+This changes **only the price commentary**. It never changes whether two items are
+identified as the same. Turning the allowance up cannot turn an Unmatched row
+into a Confirmed one, and cannot hide a Conflict.
 
 ---
 
 ## The Adjuster Ledger — the adjuster's side, fully listed
 
-The claim side gets the five verdicts above. The adjuster's side has its own
-ledger where **every adjuster row is permanently listed**:
+The inventory side gets the five labels above. The costing side has its own
+ledger where **every costing row is permanently listed**:
 
-| Status | Meaning |
+| Ledger status | Meaning |
 |---|---|
-| **Paired with claim row** | This adjuster line supports a claim item |
-| **Unmatched** | No claim item paired with it — omitted items, duplicates, or extra stock live here |
+| **Paired → A12, A48** | This costing line supports these inventory rows (there can be more than one) |
+| **Unmatched** | No identified inventory item points at it |
 
-Worked example (3 claim items vs 6 adjuster lines):
+**Unmatched costing rows are where the interesting questions live** — items the
+adjuster saw that the inventory never declared, duplicate lines, stock the
+insured didn't claim. Each unmatched row has a **Find matches** button that
+searches the inventory for its closest items. If you find the right one, one
+click confirms the pairing, the inventory row becomes **Confirmed**, and its
+price evidence is collected afresh.
 
-| Adjuster row | Ledger status | Why |
-|---|---|---|
-| common wire nail 2 inch galvanized @ ₱72 | **Paired** | The claim's nail matched it |
-| steel bolt m8 zinc @ ₱30 | **Paired** | The claim's bolt matched it |
-| zinc steel bolt m8 @ ₱31 | **Unmatched** | A second bolt line — the claim's bolt already paired with the ₱30 line |
-| pvc pipe 3 inch @ ₱180 | **Unmatched** (until you pick) | Waiting on the Multiple-matches decision |
-| pvc pipe 3 inch @ ₱185 | **Unmatched** | Once you pick one, the other stays listed as the duplicate |
-| paint brush 2 inch @ ₱95 | **Unmatched** | The claim never declared any paint brush |
-
-**Unmatched adjuster rows are where the interesting questions live** — items
-the adjuster saw that the claim never declared, duplicate lines, and
-unexplained stock. Each unmatched row has a **"Find matches"** button that
-searches the claim list for its closest items; if you find the right one, one
-click pairs them and the prices are re-compared.
+Note the two counters are deliberately different: a costing line can be paired
+with two inventory lines, and one inventory line can rest on several costing
+lines. The ledger never hides a line to make the numbers tidy.
 
 ---
 
-## "Match" vs "Paired" — an important difference
+## Jev — the AI second opinion
 
-- **Paired** means the *names* are linked — the pair exists.
-- **Match** means the pair exists **and the prices agree**.
+**Probable** and **Conflict** rows can be screened in bulk by **Jev** (TypeSafe
+AI's "System One" model). For each uncertain pair it answers one question —
+*"same item?"* — with a confidence:
 
-That's why the two counters differ: a pair with a price disagreement is
-*paired* but shows as **Mismatch** — and that difference is exactly the audit
-finding. If every pair were also a price match, there would be nothing to
-audit.
+- **80% or higher** → confirmed, the pair becomes Confirmed and its price evidence is gathered
+- **20% or lower** → rejected, the candidate is dropped
+- **In between** → stays in review for a person
 
----
+Jev is optional. Without a key, everything works and those rows simply wait for a
+human — which is how they worked before Jev existed.
 
-## When you pair rows by hand
-
-Clicking **"Match"** on an unmatched adjuster row (after using "Find
-matches") tells the app: *"these two rows are the same item."* The app
-re-points the claim row to that adjuster line and **re-compares the prices of
-the new pair**. If the prices disagree, the claim row honestly shows
-**Mismatch** — pairing changes *who gets compared to whom*; the price verdict
-is always re-delivered.
-
----
-
-## Jev — the AI reviewer
-
-Needs-review items can be screened in bulk by **Jev** (TypeSafe AI's
-"System One" model). For each uncertain pair it answers one typed question —
-*"same item?"* — with a probability:
-
-- **80% or higher** → Jev-verified, the pair becomes a match and prices are compared
-- **20% or lower** → Jev-rejected, the row is flagged
-- **In between** → stays in Needs review for a human
-
-Jev is optional — without a key, everything works and review items simply
-wait for a person.
+You can also just confirm a pair yourself with the **Confirm this match** button.
+A person outranks Jev, and you can always overrule either one.
 
 ---
 
 ## Your data stays yours
 
-Files are read, matched, and analysed **entirely in your browser**. Nothing is
-uploaded to any server, there is no database, and closing the tab erases
-everything. The only things ever saved (in your own browser) are your Jev API
-key and your dark/light preference — and only if you choose to connect Jev.
+- Your files are read **by your own browser** and are **never uploaded** to any server.
+- Matching runs on your own computer, in a background process in the page.
+- Results live only while the tab is open. **Refreshing the page erases them.**
+- There is no database and nothing is saved on any server.
+- The only thing that ever leaves your machine is Jev screening, and that sends **only the two text descriptions** of the pair being screened. Nothing is stored or logged.
+- The only things this app remembers anywhere are your Jev API key and your light/dark preference — and both live in your own browser, not on a server.
+
+If the app is offline, everything except Jev screening still works.
 
 ---
 
@@ -163,22 +250,31 @@ key and your dark/light preference — and only if you choose to connect Jev.
 
 | Knob | What it does |
 |---|---|
-| **Auto-accept cutoff (90)** | Name-score at or above this auto-matches. Lower it to auto-match more borderline names |
-| **Review floor (60)** | Scores below this are dropped entirely (except the single best candidate) |
-| **Price tolerance (%)** | A price gap within this percentage of the claimed price still counts as a Match — presets from Exact to ±50% |
-| **Depreciation allowance (ACV mode)** | Adjusters often value items below replacement cost. Gaps within this percentage *below* the claim are expected, and are reclassified with a note instead of crying Mismatch |
-| **Item-code stripping** | Teaches the app how item codes are embedded in names (auto-detected, or a custom pattern) |
+| **Review floor (60)** | How similar a name must be before it's even offered as a suggestion. Lower it to see more weak candidates; raise it to see fewer. |
+| **Reference gap tolerance %** | Just widens the "here's the difference" band for display and filtering. It cannot change a status. |
+| **Item-code stripping** | Teaches the app that your inventory names start with an internal code (`ITM-00122 Finishing Nail 2 inch`) and tells it how to take that code off before comparing names. |
+| **Depreciation allowance (ACV mode)** | Off / −5 / −10 / −15 / −20 / −30 / −50. Treats gaps up to that size as expected depreciation rather than overpayment. Changes price commentary only — never identity. |
+
+There is deliberately **no** "auto-accept" switch. The app cannot be configured to
+accept a match on name similarity alone.
+
+---
+
+## What it doesn't do yet
+
+Stated plainly, because a tool that hides its gaps is worse than no tool:
+
+1. **The real files have never been through it.** Everything above has been tested against invented data, not the actual Ending Inventory and Costing workbooks.
+2. **Quantity is reported, not tested.** The app adds up claimed and verified units and shows the difference, but it does not flag a row as "quantity not verified" on its own.
+3. **It does not choose an accepted price.** It gathers the evidence for that decision and lays it out; the decision is still made by a person.
+4. **Documentary support is not attached.** The inventory may declare "Specific Identification" as its costing method, but the workbook carries no lot or item identifiers that would let anyone trace a line back to a specific purchase. Until invoices, purchase journals, stock/bin cards or an inventory subsidiary ledger are supplied, that declaration is unverified — ask for them.
 
 ---
 
 ## The reports
 
-- **Claim Audit** — every claim row, its verdict, prices, and score
-- **Adjuster Ledger** — every adjuster row, paired or unmatched, with total cost
-- **Action List** — only the problems, ready to work through
-- **Price Summary** — the numbers a claim is argued in: inventory totals in
-  total cost (qty × unit price), the variance between the two inventories,
-  claim accuracy, over/underpayment exposure, quantity discrepancies, and
-  duplicate claim lines
-- **Excel export** — all of the above as a formatted 5-sheet workbook
-  (Summary, Price Summary, Claim Audit, Adjuster Ledger, Action List)
+- **Claim Audit** — every inventory row: what it was identified against, its part codes, the full cost range behind it, and its label
+- **Adjuster Ledger** — every costing row, paired or unmatched, with total cost
+- **Action List** — everything not Confirmed or Strong, ready to work through
+- **Price Summary** — both inventory totals in total cost, the variance between them, how many claims sit inside / above / below / unpriced, overpayment exposure, the quantity check, duplicate inventory lines, and costing rows nobody claimed
+- **Excel export** — all of the above as a formatted five-sheet workbook (Summary, Price Summary, Full Audit, Action List, Adjuster Ledger), with a "how to read this report" methodology block on the first two sheets

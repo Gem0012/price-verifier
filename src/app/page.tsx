@@ -14,7 +14,6 @@ import { runMatchingParallel, type ParallelRunHandle } from "@/lib/runParallel";
 import ThemeToggle from "@/components/ThemeToggle";
 import { cleanPrice } from "@/lib/normalize";
 import {
-  applyDepreciationAllowance,
   buildADuplicates,
   buildRowData,
   type AnalysisExtras,
@@ -79,6 +78,7 @@ export default function Home() {
         nameCol: first.mapping.nameCol,
         priceCol: first.mapping.priceCol,
         qtyCol,
+        codeCol: first.mapping.codeCol,
         loading: false,
         error: null,
       });
@@ -102,12 +102,14 @@ export default function Home() {
         next.nameCol = a.mapping.nameCol;
         next.priceCol = a.mapping.priceCol;
         next.qtyCol = a.columns.find((c) => QTY_LABEL.test(c.label))?.index ?? null;
+        next.codeCol = a.mapping.codeCol;
       } else if (patch.headerRow !== undefined) {
         const a = analyzeSheet(s.parsed.sheets[next.sheetIdx], patch.headerRow);
         const width = a.columns.length;
         next.nameCol = Math.min(s.nameCol, width - 1);
         next.priceCol = Math.min(s.priceCol, width - 1);
         if (next.qtyCol !== null) next.qtyCol = Math.min(next.qtyCol, width - 1);
+        if (next.codeCol !== null) next.codeCol = Math.min(next.codeCol, width - 1);
       }
       return next;
     });
@@ -136,7 +138,7 @@ export default function Home() {
       const runSettings =
         override &&
         typeof override === "object" &&
-        typeof (override as Settings).autoAccept === "number"
+        typeof (override as Settings).reviewFloor === "number"
           ? override
           : settings;
       if (!sideA.parsed || !sideB.parsed) return;
@@ -146,6 +148,7 @@ export default function Home() {
         sideA.headerRow,
         sideA.nameCol,
         sideA.priceCol,
+        sideA.codeCol,
       );
       const bRows = buildEngineRows(
         sideB.parsed,
@@ -153,6 +156,7 @@ export default function Home() {
         sideB.headerRow,
         sideB.nameCol,
         sideB.priceCol,
+        sideB.codeCol,
       );
       if (aRows.length === 0 || bRows.length === 0) {
         setRunError(
@@ -172,6 +176,7 @@ export default function Home() {
         sideB.nameCol,
         sideB.priceCol,
         sideB.qtyCol,
+        sideB.codeCol,
       ),
     );
     setStage("running");
@@ -185,7 +190,7 @@ export default function Home() {
         runSettings,
         (done, total) => setProgress({ done, total }),
         (results, parallelStats) => {
-          setResults(applyDepreciationAllowance(results, depreciationPct));
+          setResults(results);
           setStats(parallelStats);
           runRef.current = null;
           setStage("results");
@@ -197,9 +202,15 @@ export default function Home() {
         },
       );
     },
-    [sideA, sideB, settings, depreciationPct],
+    [sideA, sideB, settings],
   );
 
+  /**
+   * Manual pick = the human asserts identity. The row upgrades to CONFIRMED
+   * (method "manual") regardless of its previous classification — fuzzy leads,
+   * conflicts and unmatched rows are all resolvable this way. The picked
+   * record becomes the reference for the difference display.
+   */
   const handlePick = useCallback(
     (id: number, c: Candidate) => {
       setResults((rs) => {
@@ -209,14 +220,7 @@ export default function Home() {
             c.price !== null && r.aPrice !== null
               ? Math.round((c.price - r.aPrice) * 100) / 100
               : null;
-          const allowed =
-            r.aPrice !== null ? (Math.abs(r.aPrice) * settings.priceTolerance) / 100 : 0;
-          const status =
-            difference === null
-              ? "NEEDS_REVIEW"
-              : Math.abs(difference) <= allowed
-                ? "MATCH"
-                : "MISMATCH";
+          const inSet = r.candidates.some((x) => x.bRowNum === c.bRowNum);
           return {
             ...r,
             chosen: c,
@@ -224,38 +228,34 @@ export default function Home() {
             difference,
             method: "manual" as const,
             score: c.similarity,
-            status: status as Status,
+            status: "CONFIRMED" as Status,
+            candidates: inSet ? r.candidates : [...r.candidates, c],
             notes: [
               ...r.notes.filter((n) => !n.startsWith("Manually")),
-              `Manually picked File B row ${c.bRowNum}.`,
+              `Manually confirmed — File B row ${c.bRowNum}.`,
             ],
           };
         });
-        return mapped ? applyDepreciationAllowance(mapped, depreciationPct) : null;
+        return mapped ?? null;
       });
-    },
-    [settings.priceTolerance, depreciationPct],
-  );
-
-  /** Re-apply the depreciation allowance when the setting changes — no re-run needed. */
-  const handleDepreciationChange = useCallback(
-    (pct: number) => {
-      setDepreciationPct(pct);
-      setResults((rs) => (rs ? applyDepreciationAllowance(rs, pct) : rs));
     },
     [],
   );
 
+  /** Depreciation only affects valuation flags at render time — no re-apply. */
+  const handleDepreciationChange = useCallback((pct: number) => {
+    setDepreciationPct(pct);
+  }, []);
+
   /**
    * Apply Jev (System One) verdicts to the results.
-   *  MATCH     → attach the screened candidate if none was chosen, re-price
-   *              (Jev saying "same item" does NOT make prices equal), method
-   *              "jev", note "Jev-verified (…%)".
-   *  NOT_MATCH → status NOT_FOUND, chosen cleared, note "Jev-rejected"
-   *              (candidates stay listed so the user can still override manually).
-   *  UNCERTAIN → stays NEEDS_REVIEW, note "Jev uncertain (…) — manual review".
-   * Guards: only rows still sitting in NEEDS_REVIEW are touched — ids are
-   * reused across runs, so a decision in flight during a re-run must never
+   *  MATCH     → CONFIRMED with method "jev" (identity established; pricing
+   *              stays a separate valuation question).
+   *  NOT_MATCH → UNMATCHED, chosen cleared, note "Jev-rejected" (candidates
+   *              stay listed so the user can still override manually).
+   *  UNCERTAIN → stays PROBABLE/CONFLICT, note "Jev uncertain (…)".
+   * Guards: only rows still sitting in PROBABLE or CONFLICT are touched — ids
+   * are reused across runs, so a decision in flight during a re-run must never
    * land on a row that already left the review bucket.
    */
   const handleJevApply = useCallback(
@@ -265,9 +265,9 @@ export default function Home() {
       const pairById = new Map(pairs.map((p) => [p.id, p]));
       setResults((rs) => {
         if (!rs) return rs;
-        const mapped = rs.map((r) => {
+        return rs.map((r) => {
           const d = byId.get(r.id);
-          if (!d || r.status !== "NEEDS_REVIEW") return r;
+          if (!d || (r.status !== "PROBABLE" && r.status !== "CONFLICT")) return r;
           // Replace any previous Jev note so re-screening doesn't duplicate them.
           const otherNotes = r.notes.filter((n) => !n.startsWith("Jev"));
           if (d.verdict === "MATCH") {
@@ -284,37 +284,22 @@ export default function Home() {
               bPrice !== null && r.aPrice !== null
                 ? Math.round((bPrice - r.aPrice) * 100) / 100
                 : null;
-            const allowed =
-              r.aPrice !== null ? (Math.abs(r.aPrice) * settings.priceTolerance) / 100 : 0;
-            const status =
-              difference === null
-                ? ("NEEDS_REVIEW" as Status)
-                : Math.abs(difference) <= allowed
-                  ? ("MATCH" as Status)
-                  : ("MISMATCH" as Status);
-            const priceNote =
-              status === "MISMATCH" && difference !== null
-                ? ` Verified price differs by ${difference > 0 ? "+" : ""}${difference.toFixed(2)}.`
-                : "";
             return {
               ...r,
               chosen: cand ?? r.chosen,
               bPrice,
               difference,
               method: "jev" as const,
-              status,
+              status: "CONFIRMED" as Status,
               jevVerdict: "MATCH" as const,
               jevConfidence: d.confidence,
-              notes: [
-                ...otherNotes,
-                `Jev-verified (confidence ${d.confidence}%).${priceNote}`,
-              ],
+              notes: [...otherNotes, `Jev-verified (confidence ${d.confidence}%).`],
             };
           }
           if (d.verdict === "NOT_MATCH") {
             return {
               ...r,
-              status: "NOT_FOUND" as Status,
+              status: "UNMATCHED" as Status,
               method: null,
               score: null,
               chosen: null,
@@ -327,7 +312,6 @@ export default function Home() {
           }
           return {
             ...r,
-            status: "NEEDS_REVIEW" as Status,
             jevVerdict: "UNCERTAIN" as const,
             jevConfidence: d.confidence,
             notes: [
@@ -336,10 +320,9 @@ export default function Home() {
             ],
           };
         });
-        return applyDepreciationAllowance(mapped, depreciationPct);
       });
     },
-    [settings.priceTolerance, depreciationPct],
+    [],
   );
 
   function startOver() {
@@ -370,7 +353,7 @@ export default function Home() {
               Price Verifier
             </h1>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Masterlist vs price file — all in your browser
+              Identity-first reconciliation — all in your browser
             </p>
           </div>
         </div>
@@ -460,6 +443,7 @@ function buildEngineRows(
   headerRow: number,
   nameCol: number,
   priceCol: number,
+  codeCol: number | null,
 ): EngineInputRow[] {
   const rows = parsed.sheets[sheetIdx]?.rows ?? [];
   const out: EngineInputRow[] = [];
@@ -473,6 +457,7 @@ function buildEngineRows(
       rowNum: r + 1,
       rawName: name,
       rawPrice: row[priceCol] ?? null,
+      rawCode: codeCol === null ? null : (row[codeCol] ?? null),
     });
   }
   return out;

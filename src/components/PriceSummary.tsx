@@ -1,140 +1,127 @@
 "use client";
 
-import type { MatchResult } from "@/lib/types";
-import { extAmount, unmatchedBLines } from "@/lib/analysis";
+import { useMemo } from "react";
+import type { MatchResult, Status } from "@/lib/types";
+import {
+  extAmount,
+  overpaymentExposure,
+  unmatchedBLines,
+  valuationFlag,
+  type Valuation,
+} from "@/lib/analysis";
 import { STATUS_NAMES, fmtMoney, fmtSigned } from "./StatusPill";
 
 interface Props {
   results: MatchResult[];
-  /** Price tolerance (%) used on the last run — drives the claim-accuracy stat. */
-  tolerancePct: number;
+  /** Costing evidence per row id (all linked records + price range). */
+  valuations: Map<number, Valuation>;
+  /** Depreciation allowance (%) — explains claims above the range (ACV). */
+  depreciationPct: number;
   aQty?: Record<number, number | null>;
   bQty?: Record<number, number | null>;
   aDups?: Record<number, number[]>;
-  bRowData?: Record<number, { name: string; price: number | null; qty: number | null }>;
+  bRowData?: Record<number, { name: string; price: number | null; qty: number | null; code?: string | null }>;
 }
 
-interface Aggregates {
-  rowsWithA: number;
-  rowsWithBoth: number;
-  totalA: number;
-  totalB: number;
-  netDiff: number;
-  absDiff: number;
-  avgAbsDiffPct: number;
-  maxAbsDiffPct: number;
-  higher: { count: number; amount: number };
-  lower: { count: number; amount: number };
-  equal: number;
-  mismatch: { count: number; amountA: number; netDiff: number; overpay: number; underpay: number };
-  byStatus: {
-    status: MatchResult["status"];
-    count: number;
-    amountA: number;
-    amountB: number;
-    netDiff: number;
-  }[];
-}
-
-function aggregate(
-  results: MatchResult[],
-  tolerancePct: number,
-): { agg: Aggregates; withinTolerance: number; pricedRows: number } {
-  const a: Aggregates = {
-    rowsWithA: 0,
-    rowsWithBoth: 0,
-    totalA: 0,
-    totalB: 0,
-    netDiff: 0,
-    absDiff: 0,
-    avgAbsDiffPct: 0,
-    maxAbsDiffPct: 0,
-    higher: { count: 0, amount: 0 },
-    lower: { count: 0, amount: 0 },
-    equal: 0,
-    mismatch: { count: 0, amountA: 0, netDiff: 0, overpay: 0, underpay: 0 },
-    byStatus: [],
-  };
-  const byStatus = new Map<MatchResult["status"], { count: number; amountA: number; amountB: number; netDiff: number }>();
-  let pctSum = 0;
-  let pctRows = 0;
-
-  for (const r of results) {
-    if (r.aPrice !== null) {
-      a.rowsWithA++;
-      a.totalA += r.aPrice;
-    }
-    if (r.bPrice !== null && r.chosen) a.totalB += r.bPrice;
-    if (r.aPrice !== null && r.bPrice !== null) {
-      const d = r.difference ?? 0;
-      const pct = (Math.abs(d) / (r.aPrice || 1)) * 100;
-      a.rowsWithBoth++;
-      a.netDiff += d;
-      a.absDiff += Math.abs(d);
-      pctSum += pct;
-      pctRows++;
-      if (pct > a.maxAbsDiffPct) a.maxAbsDiffPct = pct;
-      if (d > 0) {
-        a.higher.count++;
-        a.higher.amount += d;
-      } else if (d < 0) {
-        a.lower.count++;
-        a.lower.amount += -d;
-      } else {
-        a.equal++;
-      }
-    }
-    const s = byStatus.get(r.status) ?? { count: 0, amountA: 0, amountB: 0, netDiff: 0 };
-    s.count++;
-    if (r.aPrice !== null) s.amountA += r.aPrice;
-    if (r.bPrice !== null && r.chosen) s.amountB += r.bPrice;
-    if (r.aPrice !== null && r.bPrice !== null) s.netDiff += r.difference ?? 0;
-    byStatus.set(r.status, s);
-    if (r.status === "MISMATCH" && r.aPrice !== null && r.bPrice !== null) {
-      const d = r.difference ?? 0;
-      a.mismatch.count++;
-      a.mismatch.amountA += r.aPrice;
-      a.mismatch.netDiff += d;
-      if (d > 0) a.mismatch.overpay += d;
-      else if (d < 0) a.mismatch.underpay += -d;
-    }
-  }
-  a.avgAbsDiffPct = pctRows ? pctSum / pctRows : 0;
-  const statusList: MatchResult["status"][] = [
-    "MATCH",
-    "MISMATCH",
-    "MULTIPLE",
-    "NEEDS_REVIEW",
-    "NOT_FOUND",
-  ];
-  a.byStatus = statusList
-    .filter((s) => byStatus.has(s))
-    .map((status) => ({ status, ...byStatus.get(status)! }));
-  let withinTolerance = 0;
-  for (const r of results) {
-    if (r.aPrice !== null && r.bPrice !== null) {
-      const pct = (Math.abs(r.difference ?? 0) / (r.aPrice || 1)) * 100;
-      if (pct <= tolerancePct) withinTolerance++;
-    }
-  }
-  return { agg: a, withinTolerance, pricedRows: pctRows };
-}
+const STATUS_LIST: Status[] = ["CONFIRMED", "STRONG", "PROBABLE", "CONFLICT", "UNMATCHED"];
 
 export default function PriceSummary({
   results,
-  tolerancePct,
+  valuations,
+  depreciationPct,
   aQty = {},
   bQty = {},
   aDups = {},
   bRowData = {},
 }: Props) {
-  const { agg, withinTolerance, pricedRows } = aggregate(results, tolerancePct);
-  const accuracyPct = pricedRows ? (withinTolerance / pricedRows) * 100 : 100;
+  const agg = useMemo(() => {
+    let rowsWithA = 0;
+    let totalA = 0;
+    let rowsWithBoth = 0;
+    let netDiff = 0;
+    let absDiff = 0;
+    let pctSum = 0;
+    let pctRows = 0;
+    let higher = { count: 0, amount: 0 };
+    let lower = { count: 0, amount: 0 };
+    let equal = 0;
+    const byStatus = new Map<Status, { count: number; amountA: number; amountB: number; netDiff: number }>();
+    let inRange = 0;
+    let above = 0;
+    let aboveAllowed = 0;
+    let below = 0;
+    let unpriced = 0;
+
+    for (const r of results) {
+      if (r.aPrice !== null) {
+        rowsWithA++;
+        totalA += r.aPrice;
+      }
+      if (r.aPrice !== null && r.bPrice !== null) {
+        const d = r.difference ?? 0;
+        const pct = (Math.abs(d) / (r.aPrice || 1)) * 100;
+        rowsWithBoth++;
+        netDiff += d;
+        absDiff += Math.abs(d);
+        pctSum += pct;
+        pctRows++;
+        if (d > 0) {
+          higher.count++;
+          higher.amount += d;
+        } else if (d < 0) {
+          lower.count++;
+          lower.amount += -d;
+        } else {
+          equal++;
+        }
+      }
+      const s = byStatus.get(r.status) ?? { count: 0, amountA: 0, amountB: 0, netDiff: 0 };
+      s.count++;
+      if (r.aPrice !== null) s.amountA += r.aPrice;
+      if (r.bPrice !== null) s.amountB += r.bPrice;
+      if (r.aPrice !== null && r.bPrice !== null) s.netDiff += r.difference ?? 0;
+      byStatus.set(r.status, s);
+
+      const flag = valuationFlag(valuations.get(r.id), r.aPrice, depreciationPct);
+      if (flag === "in-range") inRange++;
+      else if (flag === "above") above++;
+      else if (flag === "above-allowed") aboveAllowed++;
+      else if (flag === "below") below++;
+      else unpriced++;
+    }
+    return {
+      rowsWithA,
+      totalA,
+      rowsWithBoth,
+      netDiff,
+      absDiff,
+      avgAbsDiffPct: pctRows ? pctSum / pctRows : 0,
+      higher,
+      lower,
+      equal,
+      byStatus: STATUS_LIST.map((status) => ({
+        status,
+        ...(byStatus.get(status) ?? { count: 0, amountA: 0, amountB: 0, netDiff: 0 }),
+      })),
+      inRange,
+      above,
+      aboveAllowed,
+      below,
+      unpriced,
+      pricedRows: inRange + above + aboveAllowed + below,
+    };
+  }, [results, valuations, depreciationPct]);
+
+  const inRangePct = agg.pricedRows ? (agg.inRange / agg.pricedRows) * 100 : 100;
+  const exposure = useMemo(
+    () => overpaymentExposure(results, valuations, depreciationPct),
+    [results, valuations, depreciationPct],
+  );
   const hasQty = Object.keys(aQty).length > 0 || Object.keys(bQty).length > 0;
   const hasDups = Object.keys(aDups).length > 0;
   const hasBRows = Object.keys(bRowData).length > 0;
 
-  // Quantity check: claimed vs verified units over matched rows.
+  // Quantity check: claimed vs verified units on paired rows.
   let qtyRows = 0;
   let claimedUnits = 0;
   let verifiedUnits = 0;
@@ -152,8 +139,7 @@ export default function PriceSummary({
     }
   }
 
-  // Extended amounts: claimed (qty × claimed price) vs verified
-  // (qty × verified price) over matched rows that have quantities.
+  // Extended amounts: claimed (qty × claimed price) vs verified.
   let claimedExt: number | null = null;
   let verifiedExt: number | null = null;
   if (hasQty) {
@@ -175,7 +161,7 @@ export default function PriceSummary({
     return sum + (r?.aPrice ?? 0);
   }, 0);
 
-  // Reverse coverage: adjuster lines no claim row was matched to.
+  // Reverse coverage: costing lines no claim row was matched to.
   const unmatched = hasBRows ? unmatchedBLines(bRowData, results) : [];
   const unmatchedValue = unmatched.reduce((s, l) => s + (l.extended ?? l.price ?? 0), 0);
 
@@ -195,9 +181,10 @@ export default function PriceSummary({
     <div className="space-y-5 pb-10">
       <p className="rounded-xl bg-indigo-50 dark:bg-indigo-950/40 px-4 py-2.5 text-sm text-indigo-900 dark:text-indigo-200 ring-1 ring-indigo-200 dark:ring-indigo-800">
         <span className="font-semibold">Two inventories, fully compared.</span>{" "}
-        Claim inventory (File A) and adjuster inventory (File B) are matched by
-        name first, then compared on total cost — and every row of{" "}
-        <em>both</em> files is accounted for below.{" "}
+        Identity is established first (part numbers and descriptions — never by
+        price); once identified, every costing record for the item is collected
+        as valuation evidence below. Every row of <em>both</em> files is
+        accounted for.{" "}
         {hasQty ? "" : "Map a Qty column to compute true total-cost lines (currently assuming 1 unit per line)."}
       </p>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -207,40 +194,42 @@ export default function PriceSummary({
           value={fmtMoney(claimedInventory)}
         />
         <BigStat
-          label="Adjuster inventory total (File B)"
+          label="Costing inventory total (File B)"
           sub={`${Object.keys(bRowData).length.toLocaleString()} rows · total cost${hasQty ? "" : " (1 unit/line)"}`}
           value={fmtMoney(adjusterInventory)}
         />
         <BigStat
           label="Inventory variance"
-          sub="adjuster − claim"
+          sub="costing − claim"
           value={fmtSigned(inventoryVariance)}
           tone={inventoryVariance > 0 ? "bad" : inventoryVariance < 0 ? "good" : "neutral"}
         />
         <BigStat
           label="Total absolute gap"
-          sub="sum of every unit-price difference (matched pairs)"
+          sub="sum of every unit-price difference (paired reference records)"
           value={fmtMoney(agg.absDiff)}
         />
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
         <MiniStat
-          label="Claim accuracy"
-          value={`${accuracyPct.toFixed(1)}%`}
-          sub={`${withinTolerance.toLocaleString()} of ${pricedRows.toLocaleString()} priced rows within ±${tolerancePct}%`}
-          tone={accuracyPct >= 95 ? "good" : accuracyPct >= 80 ? "neutral" : "bad"}
+          label="In costing range"
+          value={`${inRangePct.toFixed(1)}%`}
+          sub={`${agg.inRange.toLocaleString()} of ${agg.pricedRows.toLocaleString()} priced identified rows sit inside the lowest–highest costing range`}
+          tone={inRangePct >= 95 ? "good" : inRangePct >= 80 ? "neutral" : "bad"}
         />
         <MiniStat
-          label={`Tolerance band ±${tolerancePct}%`}
-          value={
-            agg.rowsWithA > 0
-              ? `${fmtMoney((agg.totalA / agg.rowsWithA) * (1 - tolerancePct / 100))} – ${fmtMoney((agg.totalA / agg.rowsWithA) * (1 + tolerancePct / 100))}`
-              : "—"
-          }
-          sub={`accepted price window around the average claimed item (${fmtMoney(agg.rowsWithA ? agg.totalA / agg.rowsWithA : 0)}) — both directions count`}
+          label="Above the range"
+          value={agg.above.toLocaleString()}
+          sub={`claimed above every costing record${depreciationPct > 0 ? ` (±${agg.aboveAllowed.toLocaleString()} explained by the −${depreciationPct}% allowance)` : ""}`}
+          tone="bad"
         />
-        <MiniStat label="Average gap" value={`${agg.avgAbsDiffPct.toFixed(1)}%`} sub="mean |Verified − Claim|" />
+        <MiniStat
+          label="Below the range"
+          value={agg.below.toLocaleString()}
+          sub="claimed below the cheapest costing record"
+        />
+        <MiniStat label="Average gap" value={`${agg.avgAbsDiffPct.toFixed(1)}%`} sub="mean |Verified − Claim| on reference records" />
         <MiniStat
           label="Verified above claim"
           value={agg.higher.count.toLocaleString()}
@@ -260,12 +249,12 @@ export default function PriceSummary({
           <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">
             Quantity check
             <span className="ml-2 font-normal text-slate-500 dark:text-slate-400">
-              claimed vs verified units on matched rows
+              claimed vs verified units on paired rows
             </span>
           </h3>
           <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
             <MiniStat label="Claimed units" value={claimedUnits.toLocaleString()} sub={`${qtyRows} rows with qty`} />
-            <MiniStat label="Verified units" value={verifiedUnits.toLocaleString()} sub="adjuster side" />
+            <MiniStat label="Verified units" value={verifiedUnits.toLocaleString()} sub="costing side" />
             <MiniStat
               label="Net unit gap"
               value={fmtSigned(verifiedUnits - claimedUnits)}
@@ -293,7 +282,7 @@ export default function PriceSummary({
           <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">
             Extended amounts
             <span className="ml-2 font-normal text-slate-500 dark:text-slate-400">
-              quantity × unit price on matched rows — the totals claims are argued in
+              quantity × unit price on paired rows — the totals claims are argued in
             </span>
           </h3>
           <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -329,16 +318,16 @@ export default function PriceSummary({
       {hasBRows && unmatched.length > 0 && (
         <div className="rounded-2xl bg-white dark:bg-slate-900 p-5 shadow-sm ring-1 ring-slate-200 dark:ring-slate-800">
           <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">
-            Unmatched adjuster lines
+            Unmatched costing lines
             <span className="ml-2 font-normal text-slate-500 dark:text-slate-400">
-              File B rows no claim item was matched to — reconciliation in reverse
+              File B rows no claim item references — reconciliation in reverse
             </span>
           </h3>
           <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
             <MiniStat
               label="Unmatched lines"
               value={unmatched.length.toLocaleString()}
-              sub={`of ${Object.keys(bRowData).length.toLocaleString()} adjuster rows`}
+              sub={`of ${Object.keys(bRowData).length.toLocaleString()} costing rows`}
               tone={unmatched.length > 0 ? "bad" : "good"}
             />
             <MiniStat
@@ -383,7 +372,7 @@ export default function PriceSummary({
               </table>
               {unmatched.length > 20 && (
                 <p className="border-t border-slate-100 dark:border-slate-800 px-2 py-1.5 text-[11px] text-slate-400">
-                  + {(unmatched.length - 20).toLocaleString()} more — see the Unmatched Adjuster Lines sheet in the Excel export.
+                  + {(unmatched.length - 20).toLocaleString()} more — see the Adjuster Ledger sheet in the Excel export.
                 </p>
               )}
             </div>
@@ -394,21 +383,21 @@ export default function PriceSummary({
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="rounded-2xl bg-rose-50 dark:bg-rose-950/40 p-5 ring-1 ring-rose-200 dark:ring-rose-800">
           <p className="text-xs font-semibold uppercase tracking-wide text-rose-700 dark:text-rose-400">
-            Potential overpayment (discrepancies where verified &gt; claim)
+            Overpayment exposure (claim above the entire costing range)
           </p>
-          <p className="mt-1 text-2xl font-bold text-rose-800 dark:text-rose-300">{fmtMoney(agg.mismatch.overpay)}</p>
+          <p className="mt-1 text-2xl font-bold text-rose-800 dark:text-rose-300">{fmtMoney(exposure.amount)}</p>
           <p className="mt-1 text-xs text-rose-600">
-            across {agg.mismatch.count} discrepant item{agg.mismatch.count === 1 ? "" : "s"} worth{" "}
-            {fmtMoney(agg.mismatch.amountA)} at claimed prices
+            Σ (claimed − highest costing price) across {exposure.count.toLocaleString()} item{exposure.count === 1 ? "" : "s"}
+            {depreciationPct > 0 ? ` — claims within the −${depreciationPct}% depreciation allowance are excluded` : ""}
           </p>
         </div>
         <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 p-5 ring-1 ring-emerald-200 dark:ring-emerald-800">
           <p className="text-xs font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
-            Verified below claim (potential undercharge)
+            Costing below claim (potential undercharge)
           </p>
-          <p className="mt-1 text-2xl font-bold text-emerald-800 dark:text-emerald-300 dark:text-emerald-300">{fmtMoney(agg.mismatch.underpay)}</p>
+          <p className="mt-1 text-2xl font-bold text-emerald-800 dark:text-emerald-300">{fmtMoney(agg.lower.amount)}</p>
           <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-400">
-            net discrepancy gap: {fmtSigned(agg.mismatch.netDiff)}
+            net gap on reference records: {fmtSigned(agg.netDiff)}
           </p>
         </div>
       </div>

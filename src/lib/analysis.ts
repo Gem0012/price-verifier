@@ -1,16 +1,19 @@
-import type { MatchResult } from "./types.ts";
+import type { MatchResult, Status } from "./types.ts";
 import { cleanPrice, normalizeDescription } from "./normalize.ts";
 
-// ---- Claim-side analysis helpers (pure, UI/report layer) --------------------
-// Quantities, extended amounts, duplicates and depreciation are derived here
-// from the raw parsed rows and match results — the matching engine itself
-// stays untouched.
+// ---- Valuation layer (three-layer model, layer 3: valuation) ---------------
+// Identity was decided by the matching engine (part numbers / descriptions).
+// This layer never decides identity — it collects the costing EVIDENCE for
+// every identified item: all matching costing records, their price range and
+// a weighted average, so the adjuster can set an accepted cost on a documented
+// basis. Prices are explained, not matched.
 
 export type RowNum = number;
 export interface BRowData {
   name: string;
   price: number | null;
   qty: number | null;
+  code?: string | null;
 }
 export interface AnalysisExtras {
   aQty: Record<RowNum, number | null>;
@@ -29,9 +32,9 @@ export function extAmount(qty: number | null, price: number | null): number | nu
 }
 
 /**
- * Rows from one parsed sheet: rowNum -> { name, price, qty } using the
- * chosen columns. Used for reverse coverage (adjuster lines no claim row
- * matched) and extended amounts.
+ * Rows from one parsed sheet: rowNum -> { name, price, qty, code } using the
+ * chosen columns. Used for reverse coverage (costing lines no claim row
+ * matched), extended amounts and the identity keys of File B.
  */
 export function buildRowData(
   rows: unknown[][],
@@ -39,6 +42,7 @@ export function buildRowData(
   nameCol: number,
   priceCol: number,
   qtyCol: number | null,
+  codeCol: number | null = null,
 ): Record<RowNum, BRowData> {
   const out: Record<RowNum, BRowData> = {};
   for (let r = headerRow + 1; r < rows.length; r++) {
@@ -50,6 +54,12 @@ export function buildRowData(
       name: String(name).trim(),
       price: cleanPrice(row[priceCol] ?? null),
       qty: qtyCol === null ? null : cleanPrice(row[qtyCol] ?? null),
+      code:
+        codeCol === null
+          ? null
+          : row[codeCol] === null || row[codeCol] === undefined
+            ? null
+            : String(row[codeCol]).trim() || null,
     };
   }
   return out;
@@ -86,61 +96,147 @@ export function buildADuplicates(
   return dups;
 }
 
-const ALLOWANCE_NOTE = /Verified below claim by [\d.]+% — within the depreciation allowance \(([\d.]+)%\)\./;
+// ---- Costing evidence per identified item ----------------------------------
 
-/**
- * Depreciation allowance: when the adjuster applied ACV, verified prices are
- * EXPECTED to sit below the claim. Rows where the verified price is below the
- * claim by at most depreciationPct% are re-classified to MATCH with an
- * explanatory note (upward gaps are never affected).
- * Reversible: rows previously allowed under a HIGHER pct are reverted when the
- * allowance shrinks, so the displayed results always follow the setting.
- */
-export function applyDepreciationAllowance(
-  results: MatchResult[],
-  depreciationPct: number,
-): MatchResult[] {
-  const revert = (r: MatchResult): MatchResult => {
-    const stale = r.notes.find((n) => {
-      const m = ALLOWANCE_NOTE.exec(n);
-      return m && Number(m[1]) > depreciationPct;
-    });
-    if (!stale) return r;
-    return {
-      ...r,
-      status: "MISMATCH" as const,
-      notes: r.notes.filter((n) => n !== stale),
-    };
-  };
-
-  if (!depreciationPct || depreciationPct <= 0) {
-    return results.map((r) =>
-      r.status === "MATCH" && r.notes.some((n) => ALLOWANCE_NOTE.test(n)) ? revert(r) : r,
-    );
-  }
-
-  return results.map((r) => {
-    let row = r.status === "MATCH" ? revert(r) : r;
-    if (row.status !== "MISMATCH") return row;
-    if (row.bPrice === null || row.aPrice === null || row.aPrice === 0) return row;
-    if (row.bPrice >= row.aPrice) return row; // only downward gaps are depreciation-shaped
-    const gapPct = ((row.aPrice - row.bPrice) / row.aPrice) * 100;
-    if (gapPct > depreciationPct) return row;
-    const note = `Verified below claim by ${gapPct.toFixed(1)}% — within the depreciation allowance (${depreciationPct}%). Expected for ACV-style assessment.`;
-    if (row.notes.some((n) => ALLOWANCE_NOTE.test(n))) {
-      row = { ...row, notes: row.notes.map((n) => (ALLOWANCE_NOTE.test(n) ? note : n)) };
-    } else {
-      row = { ...row, notes: [...row.notes, note] };
-    }
-    return { ...row, status: "MATCH" as const };
-  });
+export interface ValuationRecord {
+  bRowNum: number;
+  name: string;
+  price: number | null;
+  qty: number | null;
+  code: string | null;
 }
 
-/** B rowNums claimed by at least one match decision (chosen or Jev-verified). */
+export interface Valuation {
+  /** Costing records with a usable positive price. */
+  count: number;
+  /** Records sharing the identity but carrying zero/unreadable prices. */
+  zeroCount: number;
+  lowest: number | null;
+  highest: number | null;
+  /** Qty-weighted average when quantities exist, otherwise the simple mean. */
+  weightedAvg: number | null;
+  records: ValuationRecord[];
+  truncated: boolean;
+}
+
+export type ValuationFlag =
+  | "in-range" // claimed price sits inside [lowest, highest]
+  | "above" // claimed above the highest costing price (potential overpayment)
+  | "above-allowed" // above the range but within the depreciation allowance (ACV)
+  | "below" // claimed below the lowest costing price
+  | "unpriced"; // no usable costing price on either side
+
+/**
+ * Collect every costing record linked to each identified claim row (the
+ * engine's candidate set — nothing is locked, so one item gathers all its
+ * costing rows and one costing row may serve several claim rows).
+ * Zero/unreadable prices are counted but excluded from the range statistics:
+ * a missing price is not evidence of a cheap item.
+ */
+export function computeValuation(
+  results: MatchResult[],
+  bQty: Record<RowNum, number | null>,
+): Map<number, Valuation> {
+  const map = new Map<number, Valuation>();
+  for (const r of results) {
+    if (r.candidates.length === 0) continue;
+    const records: ValuationRecord[] = r.candidates.map((c) => ({
+      bRowNum: c.bRowNum,
+      name: c.rawName,
+      price: c.price,
+      qty: bQty[c.bRowNum] ?? null,
+      code: c.matchedCode ?? null,
+    }));
+    const priced = records.filter((x) => x.price !== null && x.price > 0);
+    const zeroCount = records.length - priced.length;
+    const prices = priced.map((x) => x.price as number);
+    const lowest = prices.length ? Math.min(...prices) : null;
+    const highest = prices.length ? Math.max(...prices) : null;
+    let weightedAvg: number | null = null;
+    if (prices.length) {
+      const withQty = priced.filter((x) => x.qty !== null && (x.qty as number) > 0);
+      if (withQty.length > 0) {
+        let sumPQ = 0;
+        let sumQ = 0;
+        for (const x of withQty) {
+          sumPQ += (x.price as number) * (x.qty as number);
+          sumQ += x.qty as number;
+        }
+        weightedAvg = sumQ > 0 ? round2(sumPQ / sumQ) : round2(prices.reduce((a, b) => a + b, 0) / prices.length);
+      } else {
+        weightedAvg = round2(prices.reduce((a, b) => a + b, 0) / prices.length);
+      }
+    }
+    map.set(r.id, {
+      count: priced.length,
+      zeroCount,
+      lowest,
+      highest,
+      weightedAvg,
+      records,
+      truncated: false,
+    });
+  }
+  return map;
+}
+
+/**
+ * Position of the claimed price relative to the costing evidence. The
+ * depreciation allowance (ACV) is a display-layer interpretation: a claim
+ * above the costing range by at most depreciationPct% is EXPECTED when the
+ * adjuster applied actual-cash-value — it is flagged as "above-allowed"
+ * instead of plain "above". Identity statuses are never touched.
+ */
+export function valuationFlag(
+  val: Valuation | undefined,
+  aPrice: number | null,
+  depreciationPct: number,
+): ValuationFlag {
+  if (!val || val.count === 0 || aPrice === null) return "unpriced";
+  if (aPrice > (val.highest as number)) {
+    const overPct = ((aPrice - (val.highest as number)) / aPrice) * 100;
+    return depreciationPct > 0 && overPct <= depreciationPct ? "above-allowed" : "above";
+  }
+  if (aPrice < (val.lowest as number)) return "below";
+  return "in-range";
+}
+
+/**
+ * Overpayment exposure: on rows where the claim sits ABOVE the entire costing
+ * range, the amount at stake is (claimed − highest) per unit. Rows flagged
+ * above-allowed (depreciation-explained) are excluded.
+ */
+export function overpaymentExposure(
+  results: MatchResult[],
+  valuation: Map<number, Valuation>,
+  depreciationPct: number,
+): { count: number; amount: number } {
+  let count = 0;
+  let amount = 0;
+  for (const r of results) {
+    if (valuationFlag(valuation.get(r.id), r.aPrice, depreciationPct) !== "above") continue;
+    const val = valuation.get(r.id)!;
+    count++;
+    amount += r.aPrice! - (val.highest as number);
+  }
+  return { count, amount: round2(amount) };
+}
+
+/** Identity statuses that assert a real pairing (used for B-side coverage). */
+export const PAIRING_STATUSES: Status[] = ["CONFIRMED", "STRONG"];
+
+/**
+ * B rowNums asserted into the reconciliation: every candidate of a row whose
+ * identity is established (Confirmed/Strong, including manual/Jev upgrades).
+ * Probable suggestions and conflict rows do not consume costing lines — they
+ * are only leads until a human confirms them.
+ */
 export function claimedBRowNums(results: MatchResult[]): Set<RowNum> {
   const set = new Set<RowNum>();
   for (const r of results) {
+    if (!PAIRING_STATUSES.includes(r.status)) continue;
     if (r.chosen) set.add(r.chosen.bRowNum);
+    for (const c of r.candidates) set.add(c.bRowNum);
   }
   return set;
 }
@@ -153,7 +249,7 @@ export interface UnmatchedBLine {
   extended: number | null;
 }
 
-/** Adjuster lines no claim row was matched to — the reverse-coverage view. */
+/** Costing lines no claim row was matched to — the reverse-coverage view. */
 export function unmatchedBLines(
   bRows: Record<RowNum, BRowData>,
   results: MatchResult[],
@@ -172,4 +268,8 @@ export function unmatchedBLines(
     });
   }
   return out.sort((x, y) => (y.extended ?? -1) - (x.extended ?? -1) || x.rowNum - y.rowNum);
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }

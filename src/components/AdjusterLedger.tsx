@@ -2,16 +2,16 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { Candidate, MatchResult } from "@/lib/types";
-import { extAmount } from "@/lib/analysis";
+import { extAmount, PAIRING_STATUSES } from "@/lib/analysis";
 import { normalizeDescription, numericSiblingPenaltyTokens, similarity, tokenCounts } from "@/lib/normalize";
 import { fmtMoney } from "./StatusPill";
 
 const PAGE_SIZE = 100;
 
 interface Props {
-  /** Every File B row keyed by rowNum: name, unit price, qty. */
-  bRowData: Record<number, { name: string; price: number | null; qty: number | null }>;
-  /** Match decisions — a B row is "matched" when some claim row chose it. */
+  /** Every File B row keyed by rowNum: name, unit price, qty, part code. */
+  bRowData: Record<number, { name: string; price: number | null; qty: number | null; code?: string | null }>;
+  /** Match decisions — a B row is "paired" when an established identity references it. */
   results: MatchResult[];
   /** Manually pair an unmatched adjuster row with a claim row (same as a pick). */
   onPick: (id: number, c: Candidate) => void;
@@ -20,14 +20,15 @@ interface Props {
 interface LedgerRow {
   rowNum: number;
   name: string;
+  code: string | null;
   price: number | null;
   qty: number | null;
   total: number | null;
   matched: boolean;
-  matchedARow: number | null;
-  matchedAName: string | null;
-  /** Price verdict of the pairing — an attribute, never the ledger status */
-  priceAgreed: boolean | null;
+  matchedARows: number[];
+  matchedANames: string[];
+  /** Claimed price of the first supporting claim row, and the gap to it. */
+  refAPrice: number | null;
   diffPct: number | null;
 }
 
@@ -54,9 +55,10 @@ function findCandidateClaims(
 }
 
 /**
- * The adjuster-side inventory ledger: EVERY File B row is listed here —
- * matched (with the claim row it supports) or unmatched. Nothing from
- * either file is ever dropped from the comparison.
+ * The costing-side inventory ledger: EVERY File B row is listed here — paired
+ * with the claim row(s) it supports, or unmatched. Nothing from either file is
+ * ever dropped from the comparison, and one costing row may support several
+ * claim rows (identity is shared, nothing is locked).
  */
 export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
   const [query, setQuery] = useState("");
@@ -66,25 +68,27 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
   const [page, setPage] = useState(0);
   const [reverseRow, setReverseRow] = useState<LedgerRow | null>(null);
 
-  const matchedByB = useMemo(() => {
-    // pairing info + the price verdict of the pairing (attribute, not status —
-    // the ledger's own status stays about coverage: paired vs unmatched)
+  const supportsByB = useMemo(() => {
+    // pairing info + the claimed price of the first supporting row
     const m = new Map<
       number,
-      { aRow: number; aName: string; priceAgreed: boolean; diffPct: number | null }
+      { aRows: number[]; aNames: string[]; refAPrice: number | null }
     >();
     for (const r of results) {
-      if (r.chosen && !m.has(r.chosen.bRowNum)) {
-        const diffPct =
-          r.difference !== null && r.aPrice !== null && r.aPrice !== 0
-            ? (Math.abs(r.difference) / r.aPrice) * 100
-            : null;
-        m.set(r.chosen.bRowNum, {
-          aRow: r.aRowNum,
-          aName: r.aRawName,
-          priceAgreed: r.status === "MATCH",
-          diffPct,
-        });
+      if (!PAIRING_STATUSES.includes(r.status)) continue;
+      const nums = new Set<number>(r.candidates.map((c) => c.bRowNum));
+      if (r.chosen) nums.add(r.chosen.bRowNum);
+      for (const bn of nums) {
+        let entry = m.get(bn);
+        if (!entry) {
+          entry = { aRows: [], aNames: [], refAPrice: null };
+          m.set(bn, entry);
+        }
+        if (!entry.aRows.includes(r.aRowNum)) {
+          entry.aRows.push(r.aRowNum);
+          entry.aNames.push(r.aRawName);
+          if (entry.refAPrice === null && r.aPrice !== null) entry.refAPrice = r.aPrice;
+        }
       }
     }
     return m;
@@ -93,49 +97,50 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
   const rows = useMemo(() => {
     const ledger: LedgerRow[] = Object.entries(bRowData).map(([numStr, row]) => {
       const rowNum = Number(numStr);
-      const m = matchedByB.get(rowNum);
+      const s = supportsByB.get(rowNum);
+      const refAPrice = s?.refAPrice ?? null;
+      const diffPct =
+        refAPrice !== null && row.price !== null && refAPrice !== 0
+          ? (Math.abs(row.price - refAPrice) / refAPrice) * 100
+          : null;
       return {
         rowNum,
         name: row.name,
+        code: row.code ?? null,
         price: row.price,
         qty: row.qty,
         total: extAmount(row.qty, row.price) ?? row.price,
-        matched: !!m,
-        matchedARow: m?.aRow ?? null,
-        matchedAName: m?.aName ?? null,
-        priceAgreed: m?.priceAgreed ?? null,
-        diffPct: m?.diffPct ?? null,
+        matched: !!s,
+        matchedARows: s?.aRows ?? [],
+        matchedANames: s?.aNames ?? [],
+        refAPrice,
+        diffPct,
       };
     });
     const q = query.trim().toLowerCase();
     let list = ledger;
-    if (filter === "paired-agreed") list = list.filter((r) => r.matched && r.priceAgreed);
-    if (filter === "paired-differs") list = list.filter((r) => r.matched && !r.priceAgreed);
+    if (filter === "paired-agreed")
+      list = list.filter((r) => r.matched && r.diffPct !== null && r.diffPct <= 5);
+    if (filter === "paired-differs")
+      list = list.filter((r) => r.matched && (r.diffPct === null || r.diffPct > 5));
     if (filter === "unmatched") list = list.filter((r) => !r.matched);
-    if (q) list = list.filter((r) => r.name.toLowerCase().includes(q));
+    if (q)
+      list = list.filter(
+        (r) =>
+          r.name.toLowerCase().includes(q) ||
+          (r.code !== null && r.code.toLowerCase().includes(q)),
+      );
     // Unmatched first (they need attention), then by row number.
     return list.sort((x, y) => (x.matched === y.matched ? x.rowNum - y.rowNum : x.matched ? 1 : -1));
-  }, [bRowData, matchedByB, query, filter]);
+  }, [bRowData, supportsByB, query, filter]);
 
   useEffect(() => setPage(0), [query, filter]);
 
   const counts = useMemo(() => {
-    let agreed = 0;
-    let differs = 0;
-    for (const r of results) {
-      if (!r.chosen) continue;
-      if (r.status === "MISMATCH") differs++;
-      else agreed++;
-    }
-    const matched = agreed + differs;
-    return {
-      agreed,
-      differs,
-      matched,
-      unmatched: Object.keys(bRowData).length - matched,
-      all: Object.keys(bRowData).length,
-    };
-  }, [bRowData, results]);
+    const paired = supportsByB.size;
+    const all = Object.keys(bRowData).length;
+    return { paired, unmatched: all - paired, all };
+  }, [bRowData, supportsByB]);
 
   const inventoryTotal = useMemo(
     () =>
@@ -153,7 +158,7 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
   return (
     <div className="space-y-3 pb-10">
       <p className="rounded-xl bg-white dark:bg-slate-900 px-4 py-2.5 text-sm text-slate-600 dark:text-slate-300 ring-1 ring-slate-200 dark:ring-slate-800">
-        Every adjuster row is listed here — nothing is dropped. Inventory total
+        Every costing row is listed here — nothing is dropped. Inventory total
         (qty × unit price):{" "}
         <span className="font-semibold tabular-nums">{fmtMoney(inventoryTotal)}</span>
       </p>
@@ -162,7 +167,7 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search adjuster items…"
+          placeholder="Search costing items or part codes…"
           className="w-64 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 outline-none focus:border-indigo-500"
         />
         {(["all", "paired-agreed", "paired-differs", "unmatched"] as const).map((f) => (
@@ -178,9 +183,9 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
             {f === "all"
               ? `All (${counts.all.toLocaleString()})`
               : f === "paired-agreed"
-                ? `Paired · price agreed (${counts.agreed.toLocaleString()})`
+                ? `Paired · ≤5% from claim (${counts.paired.toLocaleString()} paired)`
                 : f === "paired-differs"
-                  ? `Paired · price differs (${counts.differs.toLocaleString()})`
+                  ? `Paired · >5% from claim (${counts.paired.toLocaleString()} paired)`
                   : `Unmatched (${counts.unmatched.toLocaleString()})`}
           </button>
         ))}
@@ -195,6 +200,7 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
             <tr className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500 shadow-[0_1px_0_0_#e2e8f0] dark:bg-slate-800 dark:text-slate-300 dark:shadow-[0_1px_0_0_#1e293b]">
               <th className="px-3 py-2 font-semibold">B row</th>
               <th className="px-3 py-2 font-semibold">Description</th>
+              <th className="px-3 py-2 font-semibold">Part code</th>
               <th className="px-3 py-2 text-right font-semibold">Qty</th>
               <th className="px-3 py-2 text-right font-semibold">Unit price</th>
               <th className="px-3 py-2 text-right font-semibold">Total cost</th>
@@ -214,14 +220,18 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
                   <div className="truncate font-medium text-slate-800 dark:text-slate-100" title={r.name}>
                     {r.name}
                   </div>
-                  {r.matched && r.matchedAName && (
+                  {r.matched && r.matchedARows.length > 0 && (
                     <div
                       className="truncate text-xs text-emerald-600 dark:text-emerald-400"
-                      title={r.matchedAName}
+                      title={r.matchedANames.join(" | ")}
                     >
-                      ↳ supports claim row {r.matchedARow}
+                      ↳ supports claim row{r.matchedARows.length === 1 ? "" : "s"}{" "}
+                      {r.matchedARows.map((n) => `A${n}`).join(", ")}
                     </div>
                   )}
+                </td>
+                <td className="px-3 py-2 font-mono text-xs text-slate-500 dark:text-slate-400">
+                  {r.code ?? ""}
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums text-slate-700 dark:text-slate-200">
                   {r.qty ?? "—"}
@@ -236,21 +246,18 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
                   {r.matched ? (
                     <div className="flex flex-wrap items-center gap-1.5">
                       <span className="inline-flex items-center whitespace-nowrap rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800 ring-1 ring-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-300 dark:ring-emerald-800">
-                        Matched → A{r.matchedARow}
+                        Paired → {r.matchedARows.map((n) => `A${n}`).join(", ")}
                       </span>
-                      {r.priceAgreed ? (
+                      {r.diffPct !== null && (
                         <span
-                          className="inline-flex items-center whitespace-nowrap rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600 dark:bg-slate-800 dark:text-slate-300"
-                          title="The paired claim row's price agrees (within tolerance)"
+                          className={`inline-flex items-center whitespace-nowrap rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
+                            r.diffPct <= 5
+                              ? "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                              : "bg-rose-100 text-rose-700 dark:bg-rose-900/40 dark:text-rose-300"
+                          }`}
+                          title={`Costing price vs claimed ${fmtMoney(r.refAPrice)}: ${r.diffPct.toFixed(1)}% apart`}
                         >
-                          price ✓
-                        </span>
-                      ) : (
-                        <span
-                          className="inline-flex items-center whitespace-nowrap rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:bg-rose-900/40 dark:text-rose-300"
-                          title={`The paired claim row's price differs${r.diffPct != null ? ` by ±${r.diffPct.toFixed(1)}%` : ""}`}
-                        >
-                          price differs{r.diffPct != null ? ` ±${r.diffPct.toFixed(0)}%` : ""}
+                          {r.diffPct === 0 ? "= claim" : `±${r.diffPct.toFixed(0)}% from claim`}
                         </span>
                       )}
                     </div>
@@ -273,7 +280,7 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
             ))}
             {pageRows.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-3 py-10 text-center text-sm text-slate-400 dark:text-slate-500">
+                <td colSpan={7} className="px-3 py-10 text-center text-sm text-slate-400 dark:text-slate-500">
                   No rows match the current search/filter.
                 </td>
               </tr>
@@ -317,6 +324,7 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
               rawPrice: reverseRow.price,
               price: reverseRow.price,
               similarity: sim,
+              matchedCode: reverseRow.code ?? null,
             };
             onPick(claimRowId, cand);
             setReverseRow(null);
@@ -329,8 +337,8 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
 
 /**
  * Reverse-matching modal: shows the claim items closest to an unmatched
- * adjuster row. Picking one sets that claim row's chosen match to this
- * adjuster row (re-pricing it) — the same code path as a manual pick.
+ * adjuster row. Picking one asserts identity (the claim row confirms — nothing
+ * else is discarded; all matching records stay listed on the item).
  */
 function ReverseMatchModal({
   row,
@@ -358,12 +366,13 @@ function ReverseMatchModal({
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <p className="text-xs font-semibold uppercase tracking-wide text-amber-600 dark:text-amber-400">
-                Unmatched adjuster row {row.rowNum} — find its claim item
+                Unmatched costing row {row.rowNum} — find its claim item
               </p>
               <p className="mt-1 truncate text-sm font-medium text-slate-900 dark:text-slate-50" title={row.name}>
                 {row.name}
               </p>
               <p className="text-xs text-slate-500 dark:text-slate-400">
+                {row.code && <span className="mr-2 font-mono">{row.code}</span>}
                 qty {row.qty ?? "—"} · unit {fmtMoney(row.price)} · total {fmtMoney(row.total)}
               </p>
             </div>
@@ -377,8 +386,8 @@ function ReverseMatchModal({
         </div>
         <div className="space-y-2 px-5 py-4">
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Closest claim rows by name (matched first — picking one re-points that claim row to
-            this adjuster row):
+            Closest claim rows by name (confirming one marks that claim row's identity as
+            manually verified):
           </p>
           {candidates.map(({ result, sim }) => {
             const currentB = result.chosen?.bRowNum;
@@ -402,18 +411,18 @@ function ReverseMatchModal({
                     claimed {fmtMoney(result.aPrice)}
                     {currentB != null && (
                       <span className="ml-1 text-amber-600 dark:text-amber-400">
-                        · currently matched to B{currentB}
+                        · currently references B{currentB}
                       </span>
                     )}
-                    {result.status === "NOT_FOUND" && " · was not found"}
-                    {result.status === "NEEDS_REVIEW" && " · was in review"}
+                    {result.status === "UNMATCHED" && " · was unmatched"}
+                    {result.status === "PROBABLE" && " · was probable"}
                   </p>
                 </div>
                 <button
                   onClick={() => onAssign(result.id, sim)}
                   className="shrink-0 rounded-lg bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-700 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-200"
                 >
-                  Match
+                  Confirm
                 </button>
               </div>
             );

@@ -1,23 +1,71 @@
 import type { CodeStripConfig } from "./types.ts";
 
 /**
+ * Domain abbreviation standardization — auto-parts shorthand written many ways
+ * collapses to one canonical token, so "FRT", "FR" and "Front" all compare
+ * equal. Distinctions that carry meaning (left vs right) map to DIFFERENT
+ * canonical words; nothing is merged away.
+ */
+const ABBREV_TOKENS: Record<string, string> = {
+  frt: "front",
+  fr: "front",
+  rr: "rear",
+  assy: "assembly",
+  lh: "left",
+  lhs: "left",
+  rh: "right",
+  rhs: "right",
+};
+
+function applyAbbreviations(s: string): string {
+  // "hi lux" → "hilux" (two tokens, one model name) before token mapping.
+  s = s.replace(/\bhi lux\b/g, "hilux").replace(/\bhilux\b/g, "hilux");
+  return s
+    .split(" ")
+    .map((t) => {
+      if (t === "hi") return "hilux";
+      return ABBREV_TOKENS[t] ?? t;
+    })
+    .join(" ");
+}
+
+/**
+ * Join dimension/size runs into one token: "27 x 40 x 6", "27-40-6" and
+ * "27x40x6" all become "27x40x6", and "M8 X 40" becomes "m8x40" — so seal and
+ * bolt sizes compare equal regardless of how the separator was typed.
+ */
+function joinDimensionRuns(s: string): string {
+  s = s.replace(
+    /(\d+)\s*x\s*(\d+)(?:\s*x\s*(\d+))?(?:\s*x\s*(\d+))?/g,
+    (_m, a, b, c, d) => [a, b, c, d].filter(Boolean).join("x"),
+  );
+  // Hyphen-origin dims arrive as three spaced numbers after punctuation strip.
+  return s.replace(/\b(\d{1,3}) (\d{1,3}) (\d{1,3})\b/g, "$1x$2x$3");
+}
+
+/**
  * Normalize a description for matching: Unicode-compatible (full-width digits
  * and letters become ASCII), lowercase, trim, collapse spaces, strip
- * punctuation/symbols (kept as spaces so words stay separated).
+ * punctuation/symbols (kept as spaces so words stay separated), join dimension
+ * runs, and standardize domain abbreviations (FRT→front, ASSY→assembly, LH→left…).
  */
 export function normalizeDescription(value: unknown): string {
   if (value === null || value === undefined) return "";
-  return String(value)
-    .normalize("NFKC")
-    .replace(/[\u2019\u2018]/g, "'")
-    .replace(/[\u201C\u201D]/g, '"')
-    .replace(/[\u00D7\u2715]/g, "x")
-    .replace(/[\u2013\u2014]/g, "-")
-    .replace(/\u00A0/g, " ")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ");
+  return applyAbbreviations(
+    joinDimensionRuns(
+      String(value)
+        .normalize("NFKC")
+        .replace(/[\u2019\u2018]/g, "'")
+        .replace(/[\u201C\u201D]/g, '"')
+        .replace(/[\u00D7\u2715]/g, "x")
+        .replace(/[\u2013\u2014]/g, "-")
+        .replace(/\u00A0/g, " ")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim()
+        .replace(/\s+/g, " "),
+    ),
+  );
 }
 
 /**
@@ -239,13 +287,18 @@ export function similarity(a: string, b: string): number {
 /** A plausible item-code token: letters/digits (optionally - or / separated), must contain a digit. */
 const CODE_TOKEN = /^(?=.*\d)[a-z0-9]+(?:[-/][a-z0-9]+)*$/i;
 
+/** Dimension runs ("27x40x6", "8x40") are sizes, never item codes. */
+function isDimToken(token: string): boolean {
+  return /^\d+(?:x\d+)+$/.test(token);
+}
+
 function looksLikeCodeFirst(token: string): boolean {
-  return CODE_TOKEN.test(token);
+  return !isDimToken(token) && CODE_TOKEN.test(token);
 }
 
 /** Last-token codes must contain a letter or be long (so sizes like "40" are not stripped). */
 function looksLikeCodeLast(token: string): boolean {
-  return CODE_TOKEN.test(token) && (/[a-z]/i.test(token) || token.length >= 5);
+  return !isDimToken(token) && CODE_TOKEN.test(token) && (/[a-z]/i.test(token) || token.length >= 5);
 }
 
 /** Drop enclosing brackets so "(ITM-0001)" is recognized as a code token. */

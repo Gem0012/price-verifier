@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { MatchResult, Status } from "@/lib/types";
+import type { Valuation } from "@/lib/analysis";
 import { StatusPill, STATUS_NAMES, fmtMoney, fmtSigned } from "./StatusPill";
 
 export type SortKey =
@@ -15,19 +16,19 @@ export type SortKey =
 
 const PAGE_SIZE = 100;
 const STATUS_ORDER: Status[] = [
-  "MISMATCH",
-  "MULTIPLE",
-  "NEEDS_REVIEW",
-  "NOT_FOUND",
-  "MATCH",
+  "CONFLICT",
+  "PROBABLE",
+  "UNMATCHED",
+  "STRONG",
+  "CONFIRMED",
 ];
 
 const ROW_EDGE: Record<Status, string> = {
-  MATCH: "border-l-emerald-300",
-  MISMATCH: "border-l-rose-400",
-  MULTIPLE: "border-l-orange-400",
-  NEEDS_REVIEW: "border-l-amber-400",
-  NOT_FOUND: "border-l-slate-300",
+  CONFIRMED: "border-l-emerald-300",
+  STRONG: "border-l-teal-300",
+  PROBABLE: "border-l-amber-400",
+  CONFLICT: "border-l-rose-400",
+  UNMATCHED: "border-l-slate-300",
 };
 
 const JEV_BADGE: Record<string, { label: string; cls: string }> = {
@@ -42,6 +43,8 @@ interface Props {
   aQty?: Record<number, number | null>;
   bQty?: Record<number, number | null>;
   aDups?: Record<number, number[]>;
+  /** Costing evidence per row id — drives the range column. */
+  valuations?: Map<number, Valuation>;
   onOpen: (id: number) => void;
 }
 
@@ -51,6 +54,7 @@ export default function ResultsTable({
   aQty = {},
   bQty = {},
   aDups = {},
+  valuations,
   onOpen,
 }: Props) {
   const hasQty = Object.keys(aQty).length > 0 || Object.keys(bQty).length > 0;
@@ -88,7 +92,8 @@ export default function ResultsTable({
     const tol = Number(gapPct);
     const tolActive = gapPct.trim() !== "" && Number.isFinite(tol) && tol >= 0;
     let list = results;
-    if (problemsOnly) list = list.filter((r) => r.status !== "MATCH");
+    if (problemsOnly)
+      list = list.filter((r) => r.status !== "CONFIRMED" && r.status !== "STRONG");
     if (statusFilter !== "all") list = list.filter((r) => r.status === statusFilter);
     if (q) {
       list = list.filter(
@@ -147,7 +152,7 @@ export default function ResultsTable({
   const counts = useMemo(() => {
     const c = new Map<Status, number>();
     for (const r of results) {
-      if (problemsOnly && r.status === "MATCH") continue;
+      if (problemsOnly && (r.status === "CONFIRMED" || r.status === "STRONG")) continue;
       c.set(r.status, (c.get(r.status) ?? 0) + 1);
     }
     return c;
@@ -180,7 +185,7 @@ export default function ResultsTable({
             onClick={() => setStatusFilter("all")}
             label={`All (${results.length.toLocaleString()})`}
           />
-          {[...STATUS_ORDER.filter((s) => (counts.get(s) ?? 0) > 0 || s === "MISMATCH")].map(
+          {[...STATUS_ORDER.filter((s) => (counts.get(s) ?? 0) > 0 || s === "CONFLICT")].map(
             (s) => (
               <FilterChip
                 key={s}
@@ -249,6 +254,9 @@ export default function ResultsTable({
               <Th sortKey="bPrice" cur={sortKey} asc={asc} onSort={toggleSort} className="text-right">
                 B price
               </Th>
+              <th className="px-3 py-2 text-right text-xs font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                Costing records
+              </th>
               <Th sortKey="diff" cur={sortKey} asc={asc} onSort={toggleSort} className="text-right">
                 Diff
               </Th>
@@ -288,6 +296,11 @@ export default function ResultsTable({
                       title={r.chosen.rawName}
                     >
                       ↳ B{r.chosen.bRowNum}: {r.chosen.rawName}
+                      {r.candidates.length > 1 && (
+                        <span className="text-slate-400 dark:text-slate-500">
+                          {" "}· +{r.candidates.length - 1} more matching record{r.candidates.length === 2 ? "" : "s"}
+                        </span>
+                      )}
                     </div>
                   ) : r.candidates.length > 0 ? (
                     <div className="text-xs text-slate-400 dark:text-slate-500">
@@ -319,6 +332,24 @@ export default function ResultsTable({
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums text-slate-700 dark:text-slate-200">
                   {fmtMoney(r.bPrice)}
+                </td>
+                <td
+                  className="px-3 py-2 text-right text-xs tabular-nums text-slate-600 dark:text-slate-300"
+                  title="All costing records sharing this identity, and their price range"
+                >
+                  {(() => {
+                    const val = valuations?.get(r.id);
+                    if (!val || val.count === 0) return "—";
+                    const extras = val.zeroCount > 0 ? ` (+${val.zeroCount} ₱0)` : "";
+                    return (
+                      <>
+                        {val.count} rec{val.count === 1 ? "" : "s"}
+                        <span className="block text-[11px] text-slate-400 dark:text-slate-500">
+                          {fmtMoney(val.lowest)} – {fmtMoney(val.highest)}{extras}
+                        </span>
+                      </>
+                    );
+                  })()}
                 </td>
                 <td
                   className={`px-3 py-2 text-right tabular-nums font-medium ${
@@ -355,7 +386,7 @@ export default function ResultsTable({
             ))}
             {pageRows.length === 0 && (
               <tr>
-                <td colSpan={hasQty ? 8 : 7} className="px-3 py-10 text-center text-sm text-slate-400 dark:text-slate-500">
+                <td colSpan={hasQty ? 9 : 8} className="px-3 py-10 text-center text-sm text-slate-400 dark:text-slate-500">
                   No rows match the current search/filter.
                 </td>
               </tr>

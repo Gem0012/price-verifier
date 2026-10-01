@@ -2,6 +2,7 @@
 
 import { useEffect } from "react";
 import type { Candidate, MatchResult } from "@/lib/types";
+import { valuationFlag, type Valuation } from "@/lib/analysis";
 import { StatusPill, fmtMoney, fmtSigned } from "./StatusPill";
 
 interface Props {
@@ -11,6 +12,10 @@ interface Props {
   screening: boolean;
   aQty?: Record<number, number | null>;
   bQty?: Record<number, number | null>;
+  /** Costing evidence for this row (all matching records + price range). */
+  valuations?: Map<number, Valuation>;
+  /** Depreciation allowance (%) — explains claims above the costing range. */
+  depreciationPct?: number;
   onClose: () => void;
   onPick: (id: number, c: Candidate) => void;
   /** Screen just this item's chosen pair with Jev. */
@@ -19,12 +24,25 @@ interface Props {
   onOpenSettings: () => void;
 }
 
+const FLAG_TEXT: Record<string, { label: string; tone: "good" | "bad" | "neutral" }> = {
+  "in-range": { label: "Claimed price is inside the costing range", tone: "good" },
+  above: { label: "Claimed price is ABOVE the whole costing range", tone: "bad" },
+  "above-allowed": {
+    label: "Above the range, but within the depreciation allowance (ACV)",
+    tone: "neutral",
+  },
+  below: { label: "Claimed price is below the lowest costing record", tone: "neutral" },
+  unpriced: { label: "No usable costing prices on the linked records", tone: "neutral" },
+};
+
 export default function ItemDetailModal({
   result,
   jevConnected,
   screening,
   aQty = {},
   bQty = {},
+  valuations,
+  depreciationPct = 0,
   onClose,
   onPick,
   onScreen,
@@ -41,9 +59,12 @@ export default function ItemDetailModal({
   if (!result) return null;
 
   const canPick =
-    result.status === "MULTIPLE" ||
-    result.status === "NEEDS_REVIEW" ||
-    (result.status === "NOT_FOUND" && result.candidates.length > 0);
+    result.status === "PROBABLE" ||
+    result.status === "CONFLICT" ||
+    (result.status === "UNMATCHED" && result.candidates.length > 0);
+  const inReview = result.status === "PROBABLE" || result.status === "CONFLICT";
+  const val = valuations?.get(result.id);
+  const flag = valuationFlag(val, result.aPrice, depreciationPct);
 
   return (
     <div
@@ -84,6 +105,14 @@ export default function ItemDetailModal({
         </div>
 
         <div className="space-y-5 px-5 py-5">
+          {result.aCodes.length > 0 && (
+            <div className="rounded-xl bg-indigo-50 dark:bg-indigo-950/40 px-4 py-2.5 text-sm text-indigo-900 dark:text-indigo-200 ring-1 ring-indigo-200 dark:ring-indigo-800">
+              <span className="font-semibold">Extracted part/model code{result.aCodes.length === 1 ? "" : "s"}:</span>{" "}
+              {result.aCodes.join(", ")} — codes are the primary identity evidence; the
+              description is secondary.
+            </div>
+          )}
+
           <div className="grid gap-4 md:grid-cols-2">
             <NameBlock
               label="File A"
@@ -93,12 +122,13 @@ export default function ItemDetailModal({
               price={result.aPrice}
             />
             <NameBlock
-              label="File B"
+              label="File B (reference record)"
               raw={result.chosen?.rawName ?? null}
               cleaned={result.chosen?.cleaned ?? null}
               rawPrice={result.chosen?.rawPrice ?? null}
               price={result.bPrice}
               rowNum={result.chosen?.bRowNum ?? null}
+              code={result.chosen?.matchedCode ?? null}
             />
           </div>
 
@@ -126,6 +156,77 @@ export default function ItemDetailModal({
             })()}
           </div>
 
+          {val && val.records.length > 0 && (
+            <div className="rounded-2xl bg-white dark:bg-slate-900 p-4 ring-1 ring-slate-200 dark:ring-slate-800">
+              <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                Costing evidence
+                <span className="ml-2 font-normal text-slate-500 dark:text-slate-400">
+                  every record sharing this item's identity — price is evidence, not the verdict
+                </span>
+              </h3>
+              <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <Stat label="Priced records" value={String(val.count)} />
+                <Stat label="Lowest" value={fmtMoney(val.lowest)} />
+                <Stat label="Highest" value={fmtMoney(val.highest)} />
+                <Stat label={bQty && Object.values(bQty).some((q) => q != null) ? "Wtd avg (qty)" : "Average"} value={fmtMoney(val.weightedAvg)} />
+              </div>
+              {val.zeroCount > 0 && (
+                <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                  {val.zeroCount} linked record{val.zeroCount === 1 ? "" : "s"} with a zero or
+                  unreadable price — excluded from the range (a missing price is not a low price).
+                </p>
+              )}
+              <p
+                className={`mt-2 text-sm font-medium ${
+                  FLAG_TEXT[flag].tone === "good"
+                    ? "text-emerald-700 dark:text-emerald-400"
+                    : FLAG_TEXT[flag].tone === "bad"
+                      ? "text-rose-700 dark:text-rose-400"
+                      : "text-slate-600 dark:text-slate-300"
+                }`}
+              >
+                {FLAG_TEXT[flag].label}.
+              </p>
+              <div className="mt-3 overflow-x-auto rounded-lg ring-1 ring-slate-200 dark:ring-slate-800">
+                <table className="min-w-full text-left text-xs">
+                  <thead>
+                    <tr className="bg-slate-50 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400">
+                      <th className="px-2 py-1.5 font-semibold">B row</th>
+                      <th className="px-2 py-1.5 font-semibold">Description</th>
+                      <th className="px-2 py-1.5 font-semibold">Code</th>
+                      <th className="px-2 py-1.5 text-right font-semibold">Qty</th>
+                      <th className="px-2 py-1.5 text-right font-semibold">Unit price</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {val.records.map((rec) => (
+                      <tr
+                        key={rec.bRowNum}
+                        className={`border-t border-slate-100 dark:border-slate-800 ${
+                          result.chosen?.bRowNum === rec.bRowNum
+                            ? "bg-indigo-50/60 dark:bg-indigo-500/10"
+                            : ""
+                        }`}
+                      >
+                        <td className="px-2 py-1.5 text-slate-400">{rec.bRowNum}</td>
+                        <td className="max-w-[22rem] truncate px-2 py-1.5 text-slate-700 dark:text-slate-200" title={rec.name}>
+                          {rec.name}
+                        </td>
+                        <td className="px-2 py-1.5 font-mono text-slate-500 dark:text-slate-400">
+                          {rec.code ?? ""}
+                        </td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">{rec.qty ?? "—"}</td>
+                        <td className="px-2 py-1.5 text-right tabular-nums">
+                          {rec.price === null ? "—" : rec.price === 0 ? "₱0 (excluded)" : fmtMoney(rec.price)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
           {result.notes.length > 0 && (
             <ul className="space-y-1 rounded-xl bg-amber-50 dark:bg-amber-950/40 px-4 py-3 text-sm text-amber-900 dark:text-amber-200 ring-1 ring-amber-200 dark:ring-amber-800">
               {result.notes.map((n, i) => (
@@ -134,12 +235,14 @@ export default function ItemDetailModal({
             </ul>
           )}
 
-          {result.status === "NEEDS_REVIEW" && (
+          {inReview && (
             <div className="flex items-center justify-between gap-3 rounded-xl bg-indigo-50 dark:bg-indigo-950/40 px-4 py-3 ring-1 ring-indigo-200 dark:ring-indigo-800">
               <p className="text-sm text-indigo-900 dark:text-indigo-200">
-                {result.chosen
-                  ? "Uncertain match — let Jev decide if this is the same item."
-                  : "Uncertain match — pick a candidate below first, then Jev can screen it."}
+                {result.status === "CONFLICT"
+                  ? "The part number matches but the description conflicts — let Jev check if these are really the same item."
+                  : result.chosen
+                    ? "Uncertain match — let Jev decide if this is the same item."
+                    : "Uncertain match — pick a candidate below first, then Jev can screen it."}
               </p>
               {result.chosen ? (
                 jevConnected ? (
@@ -174,10 +277,10 @@ export default function ItemDetailModal({
           {result.candidates.length > 0 && (
             <div>
               <h3 className="mb-2 text-sm font-semibold text-slate-700 dark:text-slate-200">
-                Candidate matches
+                {canPick ? "Candidate matches" : "All matching records"}
                 {canPick && (
                   <span className="ml-2 font-normal text-slate-500 dark:text-slate-400">
-                    — pick one manually to resolve this row
+                    — confirming one does not discard the others; every record stays listed
                   </span>
                 )}
               </h3>
@@ -187,6 +290,7 @@ export default function ItemDetailModal({
                     <tr className="bg-slate-50 dark:bg-slate-800/60 text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
                       <th className="px-3 py-2 font-semibold">B row</th>
                       <th className="px-3 py-2 font-semibold">Name</th>
+                      <th className="px-3 py-2 font-semibold">Code</th>
                       <th className="px-3 py-2 text-right font-semibold">Price</th>
                       <th className="px-3 py-2 text-right font-semibold">Score</th>
                       <th className="px-3 py-2" />
@@ -206,8 +310,11 @@ export default function ItemDetailModal({
                               {c.cleaned}
                             </div>
                           </td>
+                          <td className="px-3 py-2 font-mono text-xs text-slate-500 dark:text-slate-400">
+                            {c.matchedCode ?? ""}
+                          </td>
                           <td className="px-3 py-2 text-right tabular-nums text-slate-700 dark:text-slate-200">
-                            {fmtMoney(c.price)}
+                            {c.price === 0 ? "₱0" : fmtMoney(c.price)}
                           </td>
                           <td className="px-3 py-2 text-right tabular-nums text-slate-600 dark:text-slate-300">
                             {c.similarity}
@@ -219,7 +326,7 @@ export default function ItemDetailModal({
                                 disabled={isChosen}
                                 className="rounded-lg bg-slate-900 px-2.5 py-1 text-xs font-semibold text-white hover:bg-slate-700 disabled:opacity-40"
                               >
-                                {isChosen ? "Chosen" : "Use this match"}
+                                {isChosen ? "Reference" : "Confirm this match"}
                               </button>
                             )}
                           </td>
@@ -250,6 +357,7 @@ function NameBlock({
   rawPrice,
   price,
   rowNum = null,
+  code = null,
 }: {
   label: string;
   raw: string | null;
@@ -257,6 +365,7 @@ function NameBlock({
   rawPrice: unknown;
   price: number | null;
   rowNum?: number | null;
+  code?: string | null;
 }) {
   return (
     <div className="rounded-xl bg-slate-50 dark:bg-slate-800/60 px-4 py-3 ring-1 ring-slate-200 dark:ring-slate-800">
@@ -274,6 +383,11 @@ function NameBlock({
         price: <span className="tabular-nums font-semibold">{fmtMoney(price)}</span>
         {rawPrice !== null && rawPrice !== undefined && typeof rawPrice !== "number" && (
           <span className="ml-1 text-xs text-slate-400 dark:text-slate-500">(raw: {String(rawPrice)})</span>
+        )}
+        {code && (
+          <span className="ml-2 font-mono text-xs text-indigo-600 dark:text-indigo-400">
+            code: {code}
+          </span>
         )}
       </p>
     </div>

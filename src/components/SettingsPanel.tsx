@@ -28,10 +28,8 @@ export default function SettingsPanel({
   const [showKeyInput, setShowKeyInput] = useState(() => !getJevKey());
 
   const invalid =
-    draft.autoAccept < 50 ||
-    draft.autoAccept > 100 ||
     draft.reviewFloor < 0 ||
-    draft.reviewFloor >= draft.autoAccept ||
+    draft.reviewFloor > 99 ||
     draft.priceTolerance < 0 ||
     draft.priceTolerance > 50 ||
     (draft.codeStrip.mode === "regex" && !draft.codeStrip.regex?.trim());
@@ -42,29 +40,23 @@ export default function SettingsPanel({
         <div>
           <h2 className="font-semibold text-slate-900 dark:text-slate-50">Matching thresholds</h2>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Applied when you re-run the comparison. Nothing is hard-coded.
+            Applied when you re-run the comparison. Identity is decided by part
+            numbers and exact descriptions — fuzzy names only suggest review
+            candidates, never auto-accept.
           </p>
         </div>
 
         <NumField
-          label="Auto-accept cutoff"
-          hint="Fuzzy score at or above this counts as a match (50–100)."
-          value={draft.autoAccept}
-          min={50}
-          max={100}
-          onChange={(v) => setDraft({ ...draft, autoAccept: v })}
-        />
-        <NumField
           label="Review floor"
-          hint="Scores below this are dropped, except the single best candidate (0–auto-accept)."
+          hint="Fuzzy scores at or above this are kept as Probable-match candidates for review (0–99). Below it, nothing is kept."
           value={draft.reviewFloor}
           min={0}
-          max={draft.autoAccept - 1}
+          max={99}
           onChange={(v) => setDraft({ ...draft, reviewFloor: v })}
         />
         <NumField
-          label="Price tolerance (%)"
-          hint="A gap up to this percentage of the claimed price still counts as a Match (0 = exact). Up to 50%."
+          label="Reference gap tolerance (%)"
+          hint="Informational band for the difference display and Gap filter (0 = exact). Identity never depends on price."
           value={draft.priceTolerance}
           min={0}
           max={50}
@@ -93,10 +85,10 @@ export default function SettingsPanel({
             Depreciation allowance (ACV mode)
           </p>
           <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            When the adjuster valued items at actual cash value, verified prices
-            sitting below the claim by up to this percentage are expected — they
-            are reclassified to Match with a note instead of Mismatch. Applies
-            instantly, no re-run needed. 0 = off.
+            When the adjuster valued items at actual cash value, claims sitting
+            above the costing range by up to this percentage are EXPECTED — they
+            are flagged as explained instead of potential overpayment. Identity
+            statuses are never touched. Applies instantly, no re-run needed. 0 = off.
           </p>
           <div className="mt-2 flex flex-wrap gap-1.5" role="group" aria-label="Depreciation presets">
             {[0, 5, 10, 15, 20, 30, 50].map((p) => (
@@ -120,7 +112,9 @@ export default function SettingsPanel({
         </div>
 
         <label className="block">
-          <span className="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-200">Item-code stripping</span>
+          <span className="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-200">
+            Item-code stripping (name comparison only)
+          </span>
           <select
             value={draft.codeStrip.mode}
             onChange={(e) =>
@@ -172,7 +166,7 @@ export default function SettingsPanel({
         </div>
         {invalid && (
           <p className="text-xs text-rose-600">
-            Check the values: review floor must stay below the auto-accept cutoff, and a regex is
+            Check the values (review floor 0–99, tolerance 0–50) — a regex is
             required in regex mode.
           </p>
         )}
@@ -182,8 +176,9 @@ export default function SettingsPanel({
         <div>
           <h2 className="font-semibold text-slate-900 dark:text-slate-50">Jev — AI screening (TypeSafe AI)</h2>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Jev screens the Needs-review bucket: same item or not. Your API key is stored only in
-            this browser (localStorage) and is never sent anywhere except directly to TypeSafe.
+            Jev screens the Probable and Conflict rows: same item or not. Your API key is stored
+            only in this browser (localStorage) and is never sent anywhere except directly to
+            TypeSafe.
           </p>
         </div>
 

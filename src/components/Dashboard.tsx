@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { Candidate, MatchResult, Settings, Status } from "@/lib/types";
 import type { EngineStats } from "@/lib/matching";
+import { claimedBRowNums, computeValuation, type Valuation } from "@/lib/analysis";
 import ResultsTable from "./ResultsTable";
 import ItemDetailModal from "./ItemDetailModal";
 import SettingsPanel from "./SettingsPanel";
@@ -25,8 +26,8 @@ interface Props {
   /** rowNum -> other rowNums in File A sharing the same description (double-dipping flag) */
   aDups: Record<number, number[]>;
   /** All File B rows keyed by rowNum — powers the reverse-coverage report */
-  bRowData: Record<number, { name: string; price: number | null; qty: number | null }>;
-  /** Depreciation allowance (%) currently applied to displayed statuses */
+  bRowData: Record<number, { name: string; price: number | null; qty: number | null; code?: string | null }>;
+  /** Depreciation allowance (%) — explains claims above the costing range (ACV) */
   depreciationPct: number;
   onDepreciationChange: (pct: number) => void;
   busy: boolean;
@@ -46,6 +47,14 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "summary", label: "Price Summary" },
   { id: "settings", label: "Settings" },
 ];
+
+const STATUS_TOOLTIP: Record<Status, string> = {
+  CONFIRMED: "Identity established by part/model number",
+  STRONG: "Identity established by exact description",
+  PROBABLE: "Fuzzy name similarity only — verify manually or with Jev",
+  CONFLICT: "Part number matches but the description describes a different product — query the insured",
+  UNMATCHED: "No usable identity evidence on the other side",
+};
 
 export default function Dashboard({
   results,
@@ -76,24 +85,27 @@ export default function Dashboard({
 
   const detail = detailId === null ? null : (results.find((r) => r.id === detailId) ?? null);
   // Live counts: statuses change as verdicts are applied (Jev) and rows are
-  // picked manually, so derive the bucket counts from the current results.
+  // confirmed manually, so derive the bucket counts from the current results.
   const liveCounts: Record<Status, number> = {
-    MATCH: 0,
-    MISMATCH: 0,
-    MULTIPLE: 0,
-    NEEDS_REVIEW: 0,
-    NOT_FOUND: 0,
+    CONFIRMED: 0,
+    STRONG: 0,
+    PROBABLE: 0,
+    CONFLICT: 0,
+    UNMATCHED: 0,
   };
   for (const r of results) liveCounts[r.status]++;
-  const problems =
-    liveCounts.MISMATCH + liveCounts.MULTIPLE + liveCounts.NEEDS_REVIEW + liveCounts.NOT_FOUND;
+  const problems = liveCounts.PROBABLE + liveCounts.CONFLICT + liveCounts.UNMATCHED;
   const jevConnected = typeof window !== "undefined" && getJevKey() !== "";
 
-  // Needs-review rows: Jev screens the pair even when no candidate was chosen
-  // yet — the top candidate stands in (that is exactly the uncertain case).
+  // Costing evidence per identified row (ranges, weighted averages) — recomputed
+  // live because Jev/manual confirmations change the candidate sets.
+  const valuations = useMemo(() => computeValuation(results, bQty), [results, bQty]);
+
+  // Review rows: Jev screens the pair even when no candidate was chosen yet —
+  // the top candidate stands in (that is exactly the uncertain case).
   const needsReviewPairs: JevPair[] = [];
   for (const r of results) {
-    if (r.status !== "NEEDS_REVIEW") continue;
+    if (r.status !== "PROBABLE" && r.status !== "CONFLICT") continue;
     const c = r.chosen ?? r.candidates[0];
     if (c) {
       needsReviewPairs.push({
@@ -126,7 +138,7 @@ export default function Dashboard({
 
   async function handleScreenOne(id: number) {
     const r = results.find((x) => x.id === id);
-    if (!r || r.status !== "NEEDS_REVIEW") return;
+    if (!r || (r.status !== "PROBABLE" && r.status !== "CONFLICT")) return;
     const c = r.chosen ?? r.candidates[0];
     if (!c) return;
     await runScreening([{ id: r.id, aName: r.aRawName, bName: c.rawName }]);
@@ -142,18 +154,18 @@ export default function Dashboard({
       const liveStats: RunStats = {
         ...stats,
         total: results.length,
-        MATCH: liveCounts.MATCH,
-        MISMATCH: liveCounts.MISMATCH,
-        MULTIPLE: liveCounts.MULTIPLE,
-        NEEDS_REVIEW: liveCounts.NEEDS_REVIEW,
-        NOT_FOUND: liveCounts.NOT_FOUND,
+        CONFIRMED: liveCounts.CONFIRMED,
+        STRONG: liveCounts.STRONG,
+        PROBABLE: liveCounts.PROBABLE,
+        CONFLICT: liveCounts.CONFLICT,
+        UNMATCHED: liveCounts.UNMATCHED,
       };
       await downloadReport(results, liveStats, settings, fileNames, {
         aQty,
         bQty,
         aDups,
         bRows: bRowData,
-      });
+      }, { depreciationPct });
     } catch (err) {
       setExportError(`Export failed: ${(err as Error).message}`);
     } finally {
@@ -162,20 +174,19 @@ export default function Dashboard({
   }
 
   const cards: { status: Status; count: number }[] = [
-    { status: "MATCH", count: liveCounts.MATCH },
-    { status: "MISMATCH", count: liveCounts.MISMATCH },
-    { status: "MULTIPLE", count: liveCounts.MULTIPLE },
-    { status: "NEEDS_REVIEW", count: liveCounts.NEEDS_REVIEW },
-    { status: "NOT_FOUND", count: liveCounts.NOT_FOUND },
+    { status: "CONFIRMED", count: liveCounts.CONFIRMED },
+    { status: "STRONG", count: liveCounts.STRONG },
+    { status: "PROBABLE", count: liveCounts.PROBABLE },
+    { status: "CONFLICT", count: liveCounts.CONFLICT },
+    { status: "UNMATCHED", count: liveCounts.UNMATCHED },
   ];
 
-  // Two-sided accounting: claim rows (File A) sum to their statuses; adjuster
-  // rows (File B) are matched or unmatched — both files fully accounted.
-  const matchedB = new Set<number>();
-  for (const r of results) if (r.chosen) matchedB.add(r.chosen.bRowNum);
+  // Two-sided accounting: claim rows (File A) sum to their statuses; costing
+  // rows (File B) paired or unmatched — both files fully accounted.
+  const pairedB = claimedBRowNums(results);
   const bAll = Object.keys(bRowData).length;
-  const bMatched = matchedB.size;
-  const bUnmatched = bAll - bMatched;
+  const bPaired = pairedB.size;
+  const bUnmatched = bAll - bPaired;
 
   return (
     <div className="space-y-5 pb-10">
@@ -194,10 +205,10 @@ export default function Dashboard({
             <button
               key={c.status}
               onClick={() => {
-                setTab(c.status === "MATCH" ? "audit" : "action");
+                setTab(c.status === "CONFIRMED" || c.status === "STRONG" ? "audit" : "action");
               }}
               className="text-left"
-              title={`Show in ${c.status === "MATCH" ? "Claim Audit" : "Action List"}`}
+              title={STATUS_TOOLTIP[c.status]}
             >
               <StatusCard status={c.status} count={c.count} />
             </button>
@@ -207,7 +218,7 @@ export default function Dashboard({
 
       <div>
         <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
-          Adjuster side — File B ({bAll.toLocaleString()} rows — the five cards above describe the claim, not this file)
+          Costing side — File B ({bAll.toLocaleString()} rows — the five cards above describe the claim, not this file)
         </p>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <button
@@ -216,7 +227,7 @@ export default function Dashboard({
             title="Open the Adjuster Ledger — every File B row listed"
           >
             <div className="rounded-2xl bg-white dark:bg-slate-900 p-4 shadow-sm ring-1 ring-slate-200 dark:ring-slate-800 transition hover:ring-indigo-400">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">Adjuster rows</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">Costing rows</p>
               <p className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-50">{bAll.toLocaleString()}</p>
               <p className="text-[11px] text-slate-400">every row listed in the Adjuster Ledger</p>
             </div>
@@ -227,9 +238,9 @@ export default function Dashboard({
           >
             <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 p-4 shadow-sm ring-1 ring-emerald-200 dark:ring-emerald-800 transition hover:ring-emerald-400">
               <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400">Paired with claim rows</p>
-              <p className="mt-1 text-2xl font-bold text-emerald-800 dark:text-emerald-300">{bMatched.toLocaleString()}</p>
+              <p className="mt-1 text-2xl font-bold text-emerald-800 dark:text-emerald-300">{bPaired.toLocaleString()}</p>
               <p className="text-[11px] text-emerald-600 dark:text-emerald-500">
-                names paired — {liveCounts.MATCH.toLocaleString()} of them also agree on price
+                identity established — nothing is locked, one row may support several claim rows
               </p>
             </div>
           </button>
@@ -312,6 +323,7 @@ export default function Dashboard({
           aQty={aQty}
           bQty={bQty}
           aDups={aDups}
+          valuations={valuations}
           onOpen={setDetailId}
         />
       )}
@@ -324,7 +336,7 @@ export default function Dashboard({
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-white dark:bg-slate-900 px-4 py-3 shadow-sm ring-1 ring-slate-200 dark:ring-slate-800">
               <p className="text-sm text-slate-600 dark:text-slate-300">
                 {jevConnected
-                  ? "Jev (TypeSafe AI) can screen these uncertain matches for you."
+                  ? "Jev (TypeSafe AI) can screen these probable matches and conflicts for you."
                   : "Connect your TypeSafe AI key to let Jev screen these automatically — the app works fine without it."}
               </p>
               <button
@@ -337,7 +349,7 @@ export default function Dashboard({
                 {screening !== null
                   ? `Screening ${screening.done}/${screening.total}…`
                   : jevConnected
-                    ? `Screen ${needsReviewPairs.length.toLocaleString()} needs-review ${
+                    ? `Screen ${needsReviewPairs.length.toLocaleString()} review ${
                         needsReviewPairs.length === 1 ? "item" : "items"
                       } with Jev`
                     : "Connect Jev in Settings"}
@@ -350,6 +362,7 @@ export default function Dashboard({
             aQty={aQty}
             bQty={bQty}
             aDups={aDups}
+            valuations={valuations}
             onOpen={setDetailId}
           />
         </>
@@ -357,7 +370,8 @@ export default function Dashboard({
       {tab === "summary" && (
         <PriceSummary
           results={results}
-          tolerancePct={settings.priceTolerance}
+          valuations={valuations}
+          depreciationPct={depreciationPct}
           aQty={aQty}
           bQty={bQty}
           aDups={aDups}
@@ -385,6 +399,8 @@ export default function Dashboard({
         screening={screening !== null}
         aQty={aQty}
         bQty={bQty}
+        valuations={valuations}
+        depreciationPct={depreciationPct}
         onClose={() => setDetailId(null)}
         onPick={onPick}
         onScreen={(id) => void handleScreenOne(id)}
@@ -395,18 +411,18 @@ export default function Dashboard({
 }
 
 const CARD_STYLES: Record<Status, string> = {
-  MATCH: "ring-emerald-200 dark:ring-emerald-800 hover:ring-emerald-400",
-  MISMATCH: "ring-rose-200 dark:ring-rose-800 hover:ring-rose-400",
-  MULTIPLE: "ring-orange-200 dark:ring-orange-800 hover:ring-orange-400",
-  NEEDS_REVIEW: "ring-amber-200 dark:ring-amber-800 hover:ring-amber-400",
-  NOT_FOUND: "ring-slate-200 dark:ring-slate-800 hover:ring-slate-400",
+  CONFIRMED: "ring-emerald-200 dark:ring-emerald-800 hover:ring-emerald-400",
+  STRONG: "ring-teal-200 dark:ring-teal-800 hover:ring-teal-400",
+  PROBABLE: "ring-amber-200 dark:ring-amber-800 hover:ring-amber-400",
+  CONFLICT: "ring-rose-200 dark:ring-rose-800 hover:ring-rose-400",
+  UNMATCHED: "ring-slate-200 dark:ring-slate-800 hover:ring-slate-400",
 };
 const CARD_TEXT: Record<Status, string> = {
-  MATCH: "text-emerald-700 dark:text-emerald-400",
-  MISMATCH: "text-rose-700 dark:text-rose-400",
-  MULTIPLE: "text-orange-700",
-  NEEDS_REVIEW: "text-amber-700",
-  NOT_FOUND: "text-slate-600 dark:text-slate-300",
+  CONFIRMED: "text-emerald-700 dark:text-emerald-400",
+  STRONG: "text-teal-700 dark:text-teal-400",
+  PROBABLE: "text-amber-700",
+  CONFLICT: "text-rose-700 dark:text-rose-400",
+  UNMATCHED: "text-slate-600 dark:text-slate-300",
 };
 
 function StatusCard({ status, count }: { status: Status; count: number }) {

@@ -37,6 +37,11 @@ const PRICE_KEYWORDS =
 const DATE_LABEL =
   /(date|tanggal|fecha|datum|effectivity|as\s*of)/i;
 
+// Part/model/SKU code columns: "Part No.", "Product / Inventory Code", "Code",
+// "SKU", "Model No." — a separate identity signal fed to the matching engine.
+const CODE_LABEL =
+  /(part\s*(no|num|number)|model\s*(no|num|number|code)|product[^\n]{0,20}code|inventory\s*code|item\s*code|stock\s*(no|code)|sku|^code\b|kode|codigo)/i;
+
 /** Lowercase + strip diacritics so "Descripción", "PREÇO", "Nama" match keywords. */
 function foldLabel(s: string): string {
   return s
@@ -126,11 +131,11 @@ function pickNameCol(columns: SheetColumn[]): number {
   return Math.max(best, 0);
 }
 
-function pickPriceCol(columns: SheetColumn[], exclude: number): number {
+function pickPriceCol(columns: SheetColumn[], exclude: number, exclude2: number): number {
   let best = -1;
   let bestScore = -Infinity;
   for (const c of columns) {
-    if (c.index === exclude) continue;
+    if (c.index === exclude || c.index === exclude2) continue;
     if (c.numericRatio < 0.3) continue;
     let score = c.numericRatio * 3;
     const folded = foldLabel(c.label);
@@ -144,20 +149,46 @@ function pickPriceCol(columns: SheetColumn[], exclude: number): number {
     }
   }
   if (best >= 0) return best;
-  // fallback: any numeric-ish column other than the name column, preferring
-  // ones that do not look like dates
+  // fallback: any numeric-ish column other than the name/code columns,
+  // preferring ones that do not look like dates
   for (const c of columns) {
     if (
       c.index !== exclude &&
+      c.index !== exclude2 &&
       c.numericRatio > 0 &&
       !DATE_LABEL.test(foldLabel(c.label))
     )
       return c.index;
   }
   for (const c of columns) {
-    if (c.index !== exclude && c.numericRatio > 0) return c.index;
+    if (c.index !== exclude && c.index !== exclude2 && c.numericRatio > 0) return c.index;
   }
   return columns.length > 1 ? 1 : 0;
+}
+
+/**
+ * Pick the part/model/SKU code column: a code-labeled column that is not the
+ * name or price column and actually carries data. Blank or zero-filled code
+ * columns still qualify (the engine ignores unreadable values) — the real
+ * Ending Inventory pattern is a blank code column with codes embedded in the
+ * descriptions instead.
+ */
+function pickCodeCol(columns: SheetColumn[], nameCol: number, priceCol: number): number | null {
+  let best = -1;
+  let bestScore = -Infinity;
+  for (const c of columns) {
+    if (c.index === nameCol || c.index === priceCol) continue;
+    if (!(c.stringRatio > 0 || c.numericRatio > 0)) continue;
+    const folded = foldLabel(c.label);
+    if (!CODE_LABEL.test(folded)) continue;
+    let score = Math.max(c.stringRatio, c.numericRatio) * 2;
+    if (/^code$|part\s*(no|num|number)|sku/.test(folded)) score += 3;
+    if (score > bestScore) {
+      bestScore = score;
+      best = c.index;
+    }
+  }
+  return best >= 0 ? best : null;
 }
 
 export function analyzeSheet(
@@ -199,7 +230,12 @@ export function analyzeSheet(
   }
 
   const nameCol = pickNameCol(columns);
-  const priceCol = pickPriceCol(columns, nameCol);
+  const codeCol = pickCodeCol(columns, nameCol, -1);
+  const priceCol = pickPriceCol(columns, nameCol, codeCol ?? -1);
+  // A strong code label ("Part No.") may have grabbed the price column's
+  // runner-up slot; re-run code picking once the price column is final.
+  const codeColFinal =
+    codeCol !== null && codeCol !== priceCol ? codeCol : pickCodeCol(columns, nameCol, priceCol);
 
   let dataRowCount = 0;
   for (let r = headerRow + 1; r < rows.length; r++) {
@@ -211,7 +247,7 @@ export function analyzeSheet(
     name: sheet.name,
     headerRow,
     columns,
-    mapping: { sheetName: sheet.name, headerRow, nameCol, priceCol },
+    mapping: { sheetName: sheet.name, headerRow, nameCol, priceCol, codeCol: codeColFinal },
     dataRowCount,
     previewRows: rows.slice(headerRow + 1, headerRow + 9),
   };

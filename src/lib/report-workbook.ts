@@ -1,37 +1,44 @@
-import type { MatchResult, Settings } from "@/lib/types";
+import type { MatchResult, Settings, Status } from "./types.ts";
+import {
+  computeValuation,
+  overpaymentExposure,
+  PAIRING_STATUSES,
+  valuationFlag,
+  type Valuation,
+} from "./analysis.ts";
 
-export const STATUS_NAMES: Record<MatchResult["status"], string> = {
-  MATCH: "Match",
-  MISMATCH: "Mismatch",
-  MULTIPLE: "Multiple matches",
-  NEEDS_REVIEW: "Needs review",
-  NOT_FOUND: "Not found",
+export const STATUS_NAMES: Record<Status, string> = {
+  CONFIRMED: "Confirmed match",
+  STRONG: "Strong match",
+  PROBABLE: "Probable match",
+  CONFLICT: "Conflict",
+  UNMATCHED: "Unmatched",
 };
 
 export interface RunStatsLike {
   total: number;
-  MATCH: number;
-  MISMATCH: number;
-  MULTIPLE: number;
-  NEEDS_REVIEW: number;
-  NOT_FOUND: number;
+  CONFIRMED: number;
+  STRONG: number;
+  PROBABLE: number;
+  CONFLICT: number;
+  UNMATCHED: number;
   resolvedCodeStrip: Settings["codeStrip"];
 }
 
 const FILLS: Record<string, { fg: string; bg: string }> = {
-  MATCH: { fg: "FF006100", bg: "FFC6EFCE" },
-  MISMATCH: { fg: "FF9C0006", bg: "FFFFC7CE" },
-  MULTIPLE: { fg: "FF9C6500", bg: "FFFFEB9C" },
-  NEEDS_REVIEW: { fg: "FF9C6500", bg: "FFFFEB9C" },
-  NOT_FOUND: { fg: "FF3F3F46", bg: "FFE4E4E7" },
+  CONFIRMED: { fg: "FF006100", bg: "FFC6EFCE" },
+  STRONG: { fg: "FF00695C", bg: "FFCCF0EE" },
+  PROBABLE: { fg: "FF9C6500", bg: "FFFFEB9C" },
+  CONFLICT: { fg: "FF9C0006", bg: "FFFFC7CE" },
+  UNMATCHED: { fg: "FF3F3F46", bg: "FFE4E4E7" },
 };
 
-const STATUS_ORDER: MatchResult["status"][] = [
-  "MATCH",
-  "MISMATCH",
-  "MULTIPLE",
-  "NEEDS_REVIEW",
-  "NOT_FOUND",
+const STATUS_ORDER: Status[] = [
+  "CONFIRMED",
+  "STRONG",
+  "PROBABLE",
+  "CONFLICT",
+  "UNMATCHED",
 ];
 
 const MONEY_FMT = "#,##0.00";
@@ -52,11 +59,16 @@ const AUDIT_BASE_HEADERS: readonly string[] = [
   "A Row",
   "A Item Name",
   "A Cleaned Name",
+  "A Part Codes",
   "A Price",
   "B Row",
   "B Matched Name",
   "B Cleaned Name",
   "B Price",
+  "Records",
+  "Lowest",
+  "Highest",
+  "Wtd Avg",
   "Difference",
   "Gap %",
   "Score",
@@ -64,16 +76,21 @@ const AUDIT_BASE_HEADERS: readonly string[] = [
   "Status",
 ];
 
-// 1-based column indices are computed per-sheet by buildLayout() — they shift
-// when the optional Qty / Jev Verdict columns are present.
-
 export interface QtyMaps {
   aQty: Record<number, number | null>;
   bQty: Record<number, number | null>;
   /** rowNum -> other rowNums in File A with the same description (duplicates) */
   aDups?: Record<number, number[]>;
   /** Every File B row — powers the Adjuster Ledger sheet */
-  bRows?: Record<number, { name: string; price: number | null; qty: number | null }>;
+  bRows?: Record<
+    number,
+    { name: string; price: number | null; qty: number | null; code?: string | null }
+  >;
+}
+
+export interface ReportOptions {
+  /** Depreciation allowance (%) — flags claims above range as explained (ACV). */
+  depreciationPct?: number;
 }
 
 function hasQtyData(qty?: QtyMaps): boolean {
@@ -87,12 +104,16 @@ function hasDupData(qty?: QtyMaps): boolean {
   return !!qty && Object.keys(qty.aDups ?? {}).length > 0;
 }
 
-/** Headers + 1-based column indices; qty columns slot in before B Price. */
+/**
+ * Headers + 1-based column indices. The optional Claimed/Assessed Qty pair
+ * slots in AFTER "B Cleaned Name" and BEFORE "B Price" — auditRow() pushes its
+ * eight leading cells in exactly that order, so headings and cells stay aligned.
+ */
 function buildLayout(hasJev: boolean, hasQty: boolean, hasDups = false) {
   const headers = [
-    ...AUDIT_BASE_HEADERS.slice(0, 7),
+    ...AUDIT_BASE_HEADERS.slice(0, 8),
     ...(hasQty ? ["Claimed Qty", "Assessed Qty"] : []),
-    ...AUDIT_BASE_HEADERS.slice(7),
+    ...AUDIT_BASE_HEADERS.slice(8),
     ...(hasDups ? ["Duplicate Rows"] : []),
     ...(hasJev ? ["Jev Verdict"] : []),
     "Notes",
@@ -102,6 +123,10 @@ function buildLayout(hasJev: boolean, hasQty: boolean, hasDups = false) {
     headers,
     colAPrice: col("A Price"),
     colBPrice: col("B Price"),
+    colLowest: col("Lowest"),
+    colHighest: col("Highest"),
+    colWtdAvg: col("Wtd Avg"),
+    colRecords: col("Records"),
     colDifference: col("Difference"),
     colGap: col("Gap %"),
     colStatus: col("Status"),
@@ -129,21 +154,28 @@ function auditRow(
   aQty: Record<number, number | null>,
   bQty: Record<number, number | null>,
   aDups: Record<number, number[]> = {},
+  valuation?: Valuation,
 ): (string | number | null)[] {
   const row: (string | number | null)[] = [
     r.aRowNum,
     r.aRawName,
     r.aCleaned,
+    r.aCodes.join(", "),
     r.aPrice,
     r.chosen?.bRowNum ?? null,
     r.chosen?.rawName ?? "",
     r.chosen?.cleaned ?? "",
   ];
   if (layout.colQty !== -1) {
+    // Claimed/Assessed Qty sit between "B Cleaned Name" and "B Price".
     row.push(aQty[r.aRowNum] ?? null, r.chosen ? (bQty[r.chosen.bRowNum] ?? null) : null);
   }
   row.push(
     r.bPrice,
+    valuation?.count ?? null,
+    valuation?.lowest ?? null,
+    valuation?.highest ?? null,
+    valuation?.weightedAvg ?? null,
     r.difference,
     gapPercent(r),
     r.score,
@@ -161,17 +193,13 @@ function auditRow(
 
 function applyStatusFill(
   row: import("exceljs").Row,
-  status: MatchResult["status"],
+  status: Status,
   colStatus: number,
-  colDifference: number,
 ): void {
   const fill = FILLS[status];
   const statusCell = row.getCell(colStatus);
   statusCell.font = { color: { argb: fill.fg }, bold: true };
   statusCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: fill.bg } };
-  if (status === "MISMATCH") {
-    row.getCell(colDifference).font = { color: { argb: fill.fg }, bold: true };
-  }
 }
 
 interface TableOptions {
@@ -187,7 +215,8 @@ function addTableSheet(
   rows: MatchResult[],
   hasJev: boolean,
   opts: TableOptions,
-  qty?: QtyMaps,
+  qty: QtyMaps | undefined,
+  valuation: Map<number, Valuation>,
 ): void {
   const ws = wb.addWorksheet(name);
   const layout = buildLayout(hasJev, hasQtyData(qty), hasDupData(qty));
@@ -205,6 +234,10 @@ function addTableSheet(
   // Column-level number formats: applied once, inherited by every data cell.
   ws.getColumn(layout.colAPrice).numFmt = MONEY_FMT;
   ws.getColumn(layout.colBPrice).numFmt = MONEY_FMT;
+  ws.getColumn(layout.colLowest).numFmt = MONEY_FMT;
+  ws.getColumn(layout.colHighest).numFmt = MONEY_FMT;
+  ws.getColumn(layout.colWtdAvg).numFmt = MONEY_FMT;
+  ws.getColumn(layout.colRecords).numFmt = COUNT_FMT;
   ws.getColumn(layout.colDifference).numFmt = MONEY_FMT;
   ws.getColumn(layout.colGap).numFmt = GAP_FMT;
   if (layout.colQty !== -1) {
@@ -215,8 +248,8 @@ function addTableSheet(
   }
   ws.getColumn(2).width = 46;
   ws.getColumn(3).width = 40;
-  ws.getColumn(6).width = 46;
-  ws.getColumn(7).width = 40;
+  ws.getColumn(7).width = 46;
+  ws.getColumn(8).width = 40;
   if (hasJev) ws.getColumn(headers.length - 1).width = 16;
   ws.getColumn(headers.length).width = 52; // Notes — widened so full text is readable
 
@@ -224,8 +257,8 @@ function addTableSheet(
   ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: headers.length } };
 
   for (const r of rows) {
-    const row = ws.addRow(auditRow(r, layout, aQty, bQty, aDups));
-    applyStatusFill(row, r.status, layout.colStatus, layout.colDifference);
+    const row = ws.addRow(auditRow(r, layout, aQty, bQty, aDups, valuation.get(r.id)));
+    applyStatusFill(row, r.status, layout.colStatus);
   }
 
   if (opts.zebra && rows.length > 0) {
@@ -262,23 +295,26 @@ interface PriceStats {
   totalAbsDifference: number | null;
   avgGapPct: number | null;
   maxGapPct: number | null;
-  moreItems: number;
-  moreAmount: number | null;
-  lessItems: number;
-  lessAmount: number | null;
-  equalItems: number;
-  overpayExposure: number | null;
-  underchargeExposure: number | null;
-  byStatus: Record<MatchResult["status"], StatusMoney>;
+  inRangeItems: number;
+  aboveRangeItems: number;
+  aboveRangeAmount: number | null;
+  aboveAllowedItems: number;
+  belowRangeItems: number;
+  unpricedItems: number;
+  byStatus: Record<Status, StatusMoney>;
 }
 
 const addTo = (sum: number | null, v: number): number => (sum ?? 0) + v;
 
 /** Single O(n) pass over results computing every Price Summary figure. */
-function computePriceStats(results: MatchResult[]): PriceStats {
+function computePriceStats(
+  results: MatchResult[],
+  valuation: Map<number, Valuation>,
+  depreciationPct: number,
+): PriceStats {
   const byStatus = Object.fromEntries(
     STATUS_ORDER.map((s) => [s, { items: 0, sumA: null, sumB: null, sumDiff: null }]),
-  ) as Record<MatchResult["status"], StatusMoney>;
+  ) as Record<Status, StatusMoney>;
 
   let hasJev = false;
   let totalA: number | null = null;
@@ -287,13 +323,12 @@ function computePriceStats(results: MatchResult[]): PriceStats {
   let gapSum = 0;
   let gapCount = 0;
   let maxGapPct: number | null = null;
-  let moreItems = 0;
-  let moreAmount: number | null = null;
-  let lessItems = 0;
-  let lessAmount: number | null = null;
-  let equalItems = 0;
-  let overpayExposure: number | null = null;
-  let underchargeExposure: number | null = null;
+  let inRangeItems = 0;
+  let aboveRangeItems = 0;
+  let aboveRangeAmount: number | null = null;
+  let aboveAllowedItems = 0;
+  let belowRangeItems = 0;
+  let unpricedItems = 0;
 
   for (const r of results) {
     if (r.jevVerdict != null) hasJev = true;
@@ -317,25 +352,17 @@ function computePriceStats(results: MatchResult[]): PriceStats {
         if (maxGapPct == null || gap > maxGapPct) maxGapPct = gap;
       }
     }
-    if (r.aPrice != null && r.bPrice != null) {
-      const a = r.aPrice;
-      const b = r.bPrice;
-      const diff = r.difference;
-      if (b > a) {
-        moreItems++;
-        if (diff != null) moreAmount = addTo(moreAmount, diff);
-      } else if (b < a) {
-        lessItems++;
-        if (diff != null) lessAmount = addTo(lessAmount, -diff);
-      } else {
-        equalItems++;
-      }
-      if (r.status === "MISMATCH" && diff != null) {
-        if (b > a) overpayExposure = addTo(overpayExposure, diff);
-        else if (b < a) underchargeExposure = addTo(underchargeExposure, -diff);
-      }
-    }
+    // Valuation position vs the costing evidence range.
+    const flag = valuationFlag(valuation.get(r.id), r.aPrice, depreciationPct);
+    if (flag === "in-range") inRangeItems++;
+    else if (flag === "above") aboveRangeItems++;
+    else if (flag === "above-allowed") aboveAllowedItems++;
+    else if (flag === "below") belowRangeItems++;
+    else unpricedItems++;
   }
+
+  const exposure = overpaymentExposure(results, valuation, depreciationPct);
+  aboveRangeAmount = exposure.count > 0 ? exposure.amount : null;
 
   return {
     hasJev,
@@ -345,16 +372,22 @@ function computePriceStats(results: MatchResult[]): PriceStats {
     totalAbsDifference,
     avgGapPct: gapCount > 0 ? gapSum / gapCount : null,
     maxGapPct,
-    moreItems,
-    moreAmount,
-    lessItems,
-    lessAmount,
-    equalItems,
-    overpayExposure,
-    underchargeExposure,
+    inRangeItems,
+    aboveRangeItems,
+    aboveRangeAmount,
+    aboveAllowedItems,
+    belowRangeItems,
+    unpricedItems,
     byStatus,
   };
 }
+
+const QUALIFICATION_NOTES: readonly string[] = [
+  "Model: identity (same item?), quantity and valuation are separate tests. Identity is established by part/model number and description structure; fuzzy name similarity only suggests candidates and never decides identity.",
+  "Valuation evidence: every costing record linked to an identified item is collected. The range (lowest–highest) and qty-weighted average are shown; no price is auto-accepted. Establish the insured's actual valuation basis and the policy-permitted basis before setting an accepted cost.",
+  "Documentary qualification: the inventory declares 'Specific Identification', but the workbook carries no item/lot identifiers that would allow tracing a line to a specific purchase cost. Request purchase invoices, purchase journal, stock/bin cards, receiving reports and the inventory subsidiary ledger; do not accept the declaration as proof of costing method without that support.",
+  "Zero-price costing lines: costing rows with a zero or unreadable unit price are counted as identity evidence but excluded from price ranges — a missing price is not a low price.",
+];
 
 function addPriceSummarySheet(wb: import("exceljs").Workbook, ps: PriceStats): void {
   const ws = wb.addWorksheet("Price Summary");
@@ -383,18 +416,18 @@ function addPriceSummarySheet(wb: import("exceljs").Workbook, ps: PriceStats): v
   };
 
   addMoney("Total A value (Σ A)", ps.totalA);
-  addMoney("Total B value (Σ B)", ps.totalB);
+  addMoney("Total B value (Σ B, chosen records)", ps.totalB);
   addMoney("Net difference (B − A)", ps.netDifference);
   addMoney("Total absolute difference", ps.totalAbsDifference);
   addPct("Average gap % (|B − A| ÷ A)", ps.avgGapPct);
   addPct("Largest gap %", ps.maxGapPct);
-  addCount("B costs more — items", ps.moreItems);
-  addMoney("B costs more — Σ (B − A)", ps.moreAmount);
-  addCount("B costs less — items", ps.lessItems);
-  addMoney("B costs less — Σ (A − B)", ps.lessAmount);
-  addCount("Prices equal — items", ps.equalItems);
-  addMoney("Mismatch exposure — potential overpayment (Σ B − A)", ps.overpayExposure, true);
-  addMoney("Mismatch exposure — potential undercharge (Σ A − B)", ps.underchargeExposure, true);
+  ws.addRow([]);
+  addCount("Claimed price inside costing range", ps.inRangeItems);
+  addCount("Claimed ABOVE range — potential overpayment", ps.aboveRangeItems);
+  addCount("…of which explained by depreciation allowance", ps.aboveAllowedItems);
+  addMoney("Overpayment exposure (Σ claimed − highest, above-range only)", ps.aboveRangeAmount, true);
+  addCount("Claimed BELOW range", ps.belowRangeItems);
+  addCount("Rows without usable costing prices", ps.unpricedItems);
 
   ws.addRow([]);
 
@@ -408,6 +441,14 @@ function addPriceSummarySheet(wb: import("exceljs").Workbook, ps: PriceStats): v
     row.getCell(4).numFmt = MONEY_FMT;
     row.getCell(5).numFmt = MONEY_FMT;
     row.getCell(1).font = { color: { argb: FILLS[status].fg }, bold: true };
+  }
+
+  ws.addRow([]);
+  ws.addRow(["How to read this report", ""]);
+  paintHeader(ws.getRow(ws.rowCount));
+  for (const note of QUALIFICATION_NOTES) {
+    const row = ws.addRow(["", note]);
+    row.getCell(2).alignment = { wrapText: true, vertical: "top" };
   }
 }
 
@@ -425,20 +466,19 @@ function addSummarySheet(
   const kv: [string, string | number][] = [
     ["Generated", runAt.toLocaleString()],
     ["Run timestamp (UTC)", runAt.toISOString()],
-    ["File A (masterlist)", fileNames?.a ?? "—"],
-    ["File B (prices)", fileNames?.b ?? "—"],
+    ["File A (inventory/claim)", fileNames?.a ?? "—"],
+    ["File B (costing/prices)", fileNames?.b ?? "—"],
     ["File A items", stats.total],
-    ["Match", stats.MATCH],
-    ["Mismatch", stats.MISMATCH],
-    ["Multiple matches", stats.MULTIPLE],
-    ["Needs review", stats.NEEDS_REVIEW],
-    ["Not found", stats.NOT_FOUND],
+    ["Confirmed matches", stats.CONFIRMED],
+    ["Strong matches", stats.STRONG],
+    ["Probable matches", stats.PROBABLE],
+    ["Conflicts", stats.CONFLICT],
+    ["Unmatched", stats.UNMATCHED],
     ["Settings", ""],
-    ["Auto-accept cutoff", settings.autoAccept],
-    ["Review floor", settings.reviewFloor],
-    ["Price tolerance (%)", settings.priceTolerance],
+    ["Review floor (fuzzy kept as Probable)", settings.reviewFloor],
+    ["Reference gap tolerance (%)", settings.priceTolerance],
     [
-      "Code stripping",
+      "Code stripping (name comparison only)",
       settings.codeStrip.mode === "regex"
         ? `regex: ${settings.codeStrip.regex}`
         : settings.codeStrip.mode === "auto"
@@ -457,6 +497,15 @@ function addSummarySheet(
     };
   }
   sum.addRow([]);
+  sum.addRow(["Identification & valuation model", ""]);
+  const modelHeader = sum.getRow(sum.rowCount);
+  modelHeader.font = HEADER_FONT;
+  modelHeader.fill = HEADER_FILL;
+  for (const note of QUALIFICATION_NOTES) {
+    const row = sum.addRow(["", note]);
+    row.getCell(2).alignment = { wrapText: true, vertical: "top" };
+  }
+  sum.addRow([]);
   const footer = sum.addRow([
     "Generated by Price Verifier — all matching ran in the browser",
   ]);
@@ -464,8 +513,9 @@ function addSummarySheet(
 }
 
 /**
- * Build the 4-sheet report workbook (Summary / Price Summary / Full Audit / Action List).
- * DOM-free so it can be unit-tested in Node; downloadReport() wraps it for the browser.
+ * Build the report workbook (Summary / Price Summary / Full Audit / Action
+ * List / Adjuster Ledger). DOM-free so it can be unit-tested in Node;
+ * downloadReport() wraps it for the browser.
  */
 export async function buildReportBuffer(
   results: MatchResult[],
@@ -473,6 +523,7 @@ export async function buildReportBuffer(
   settings: Settings,
   fileNames: { a: string; b: string } | null,
   qty?: QtyMaps,
+  options?: ReportOptions,
 ): Promise<import("exceljs").Buffer> {
   const mod = await import("exceljs");
   // exceljs is CJS: Node gives { default: { Workbook } }, bundlers name-scope it.
@@ -484,19 +535,20 @@ export async function buildReportBuffer(
 
   addSummarySheet(wb, stats, settings, fileNames, runAt);
 
-  const priceStats = computePriceStats(results);
+  const valuation = computeValuation(results, qty?.bQty ?? {});
+  const priceStats = computePriceStats(results, valuation, options?.depreciationPct ?? 0);
   addPriceSummarySheet(wb, priceStats);
 
   addTableSheet(wb, "Full Audit", results, priceStats.hasJev, {
     zebra: true,
     freezeFirstColumn: true,
-  }, qty);
+  }, qty, valuation);
 
-  const problems = results.filter((r) => r.status !== "MATCH");
+  const problems = results.filter((r) => r.status !== "CONFIRMED" && r.status !== "STRONG");
   addTableSheet(wb, "Action List", problems, priceStats.hasJev, {
     zebra: false,
     freezeFirstColumn: false,
-  }, qty);
+  }, qty, valuation);
 
   addAdjusterLedgerSheet(wb, results, qty);
 
@@ -504,9 +556,9 @@ export async function buildReportBuffer(
 }
 
 /**
- * Adjuster Ledger sheet: EVERY File B row listed — matched (with the claim
- * row it supports) or unmatched. Guarantees neither file is dropped from the
- * report: the claim side is the Full Audit, the adjuster side is this sheet.
+ * Adjuster Ledger sheet: EVERY File B row listed — paired with the claim row(s)
+ * it supports, or unmatched. Guarantees neither file is dropped from the
+ * report: the claim side is the Full Audit, the costing side is this sheet.
  */
 function addAdjusterLedgerSheet(
   wb: import("exceljs").Workbook,
@@ -517,21 +569,36 @@ function addAdjusterLedgerSheet(
   if (Object.keys(bRows).length === 0) return;
   const aQty = qty?.aQty ?? {};
 
-  const matchedByB = new Map<number, { aRow: number; aName: string }>();
+  // B row -> claim rows whose ESTABLISHED identity references it (candidates
+  // of Confirmed/Strong rows). Probable leads and conflicts don't count yet.
+  const supportsByB = new Map<number, { aRows: number[]; aNames: string[] }>();
   for (const r of results) {
-    if (r.chosen && !matchedByB.has(r.chosen.bRowNum)) {
-      matchedByB.set(r.chosen.bRowNum, { aRow: r.aRowNum, aName: r.aRawName });
+    if (!PAIRING_STATUSES.includes(r.status)) continue;
+    const ref = r.chosen;
+    const nums = new Set<number>(r.candidates.map((c) => c.bRowNum));
+    if (ref) nums.add(ref.bRowNum);
+    for (const bn of nums) {
+      let entry = supportsByB.get(bn);
+      if (!entry) {
+        entry = { aRows: [], aNames: [] };
+        supportsByB.set(bn, entry);
+      }
+      if (!entry.aRows.includes(r.aRowNum)) {
+        entry.aRows.push(r.aRowNum);
+        entry.aNames.push(r.aRawName);
+      }
     }
   }
 
   const ws = wb.addWorksheet("Adjuster Ledger");
-  const headers = ["B Row", "Description", "Claimed Qty", "Assessed Qty", "Unit Price", "Total Cost", "Status", "Supports Claim Row", "Matched A Item"];
+  const headers = ["B Row", "Description", "Part Code", "Claimed Qty", "Assessed Qty", "Unit Price", "Total Cost", "Status", "Supports Claim Rows", "Matched A Items"];
   ws.columns = headers.map((h) => ({ header: h, key: h, width: 18 }));
   ws.getRow(1).font = HEADER_FONT;
   ws.getRow(1).fill = HEADER_FILL;
   ws.views = [{ state: "frozen", ySplit: 1 }];
   ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: headers.length } };
   ws.getColumn(2).width = 46;
+  ws.getColumn(10).width = 46;
   ws.getColumn("Unit Price").numFmt = MONEY_FMT;
   ws.getColumn("Total Cost").numFmt = MONEY_FMT;
   ws.getColumn("Claimed Qty").numFmt = "#,##0.##";
@@ -539,32 +606,32 @@ function addAdjusterLedgerSheet(
 
   for (const [numStr, row] of Object.entries(bRows)) {
     const rowNum = Number(numStr);
-    const m = matchedByB.get(rowNum);
-    const aRowNum = m?.aRow ?? null;
-    const aItem = results.find((r) => r.aRowNum === aRowNum);
-    const claimedQty = aRowNum !== null ? (aQty[aRowNum] ?? null) : null;
+    const s = supportsByB.get(rowNum);
+    const firstARow = s?.aRows[0] ?? null;
+    const claimedQty = firstARow !== null ? (aQty[firstARow] ?? null) : null;
     const ext = row.qty != null && row.price != null
       ? Math.round(row.qty * row.price * 100) / 100
       : row.price;
     const r = ws.addRow([
       rowNum,
       row.name,
+      row.code ?? "",
       claimedQty,
       row.qty ?? null,
       row.price,
       ext,
-      m ? `Matched → A${m.aRow}` : "Unmatched",
-      aRowNum,
-      m ? m.aName : "",
+      s ? `Paired → A${s.aRows.join(", A")}` : "Unmatched",
+      s ? s.aRows.join(", ") : "",
+      s ? s.aNames.join(" | ") : "",
     ]);
     const statusCell = r.getCell("Status");
-    statusCell.font = m
+    statusCell.font = s
       ? { color: { argb: "FF006100" }, bold: true }
       : { color: { argb: "FF9C6500" }, bold: true };
     statusCell.fill = {
       type: "pattern",
       pattern: "solid",
-      fgColor: { argb: m ? "FFC6EFCE" : "FFFFEB9C" },
+      fgColor: { argb: s ? "FFC6EFCE" : "FFFFEB9C" },
     };
   }
 }

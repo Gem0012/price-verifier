@@ -5,11 +5,11 @@ import type { MatchResult, Settings } from "./types.ts";
 
 export interface ParallelRunStats {
   total: number;
-  MATCH: number;
-  MISMATCH: number;
-  MULTIPLE: number;
-  NEEDS_REVIEW: number;
-  NOT_FOUND: number;
+  CONFIRMED: number;
+  STRONG: number;
+  PROBABLE: number;
+  CONFLICT: number;
+  UNMATCHED: number;
   resolvedCodeStrip: Settings["codeStrip"];
 }
 
@@ -21,7 +21,13 @@ interface ChunkWorkerDone {
   type: "done";
   chunkIndex: number;
   results: MatchResult[];
-  stats: { MATCH: number; MISMATCH: number; MULTIPLE: number; NEEDS_REVIEW: number; NOT_FOUND: number };
+  stats: {
+    CONFIRMED: number;
+    STRONG: number;
+    PROBABLE: number;
+    CONFLICT: number;
+    UNMATCHED: number;
+  };
   resolvedCodeStrip: Settings["codeStrip"];
 }
 
@@ -81,19 +87,19 @@ export function runMatchingParallel(
     }
     const stats: ParallelRunStats = {
       total: flat.length,
-      MATCH: 0,
-      MISMATCH: 0,
-      MULTIPLE: 0,
-      NEEDS_REVIEW: 0,
-      NOT_FOUND: 0,
+      CONFIRMED: 0,
+      STRONG: 0,
+      PROBABLE: 0,
+      CONFLICT: 0,
+      UNMATCHED: 0,
       resolvedCodeStrip: resolvedCodeStrip ?? settings.codeStrip,
     };
     for (const s of perChunkStats) {
-      stats.MATCH += s.MATCH;
-      stats.MISMATCH += s.MISMATCH;
-      stats.MULTIPLE += s.MULTIPLE;
-      stats.NEEDS_REVIEW += s.NEEDS_REVIEW;
-      stats.NOT_FOUND += s.NOT_FOUND;
+      stats.CONFIRMED += s.CONFIRMED;
+      stats.STRONG += s.STRONG;
+      stats.PROBABLE += s.PROBABLE;
+      stats.CONFLICT += s.CONFLICT;
+      stats.UNMATCHED += s.UNMATCHED;
     }
     terminateAll();
     onDone(flat, stats);
