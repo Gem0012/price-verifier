@@ -224,15 +224,23 @@ export default function PriceSummary({
         />
       </div>
 
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
         <MiniStat
           label="Claim accuracy"
           value={`${accuracyPct.toFixed(1)}%`}
           sub={`${withinTolerance.toLocaleString()} of ${pricedRows.toLocaleString()} priced rows within ±${tolerancePct}%`}
           tone={accuracyPct >= 95 ? "good" : accuracyPct >= 80 ? "neutral" : "bad"}
         />
+        <MiniStat
+          label={`Tolerance band ±${tolerancePct}%`}
+          value={
+            agg.rowsWithA > 0
+              ? `${fmtMoney((agg.totalA / agg.rowsWithA) * (1 - tolerancePct / 100))} – ${fmtMoney((agg.totalA / agg.rowsWithA) * (1 + tolerancePct / 100))}`
+              : "—"
+          }
+          sub={`accepted price window around the average claimed item (${fmtMoney(agg.rowsWithA ? agg.totalA / agg.rowsWithA : 0)}) — both directions count`}
+        />
         <MiniStat label="Average gap" value={`${agg.avgAbsDiffPct.toFixed(1)}%`} sub="mean |Verified − Claim|" />
-        <MiniStat label="Largest gap" value={`${agg.maxAbsDiffPct.toFixed(1)}%`} sub="worst single item" />
         <MiniStat
           label="Verified above claim"
           value={agg.higher.count.toLocaleString()}
