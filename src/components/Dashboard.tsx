@@ -169,27 +169,79 @@ export default function Dashboard({
     { status: "NOT_FOUND", count: liveCounts.NOT_FOUND },
   ];
 
+  // Two-sided accounting: claim rows (File A) sum to their statuses; adjuster
+  // rows (File B) are matched or unmatched — both files fully accounted.
+  const matchedB = new Set<number>();
+  for (const r of results) if (r.chosen) matchedB.add(r.chosen.bRowNum);
+  const bAll = Object.keys(bRowData).length;
+  const bMatched = matchedB.size;
+  const bUnmatched = bAll - bMatched;
+
   return (
     <div className="space-y-5 pb-10">
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
-        <div className="rounded-2xl bg-white dark:bg-slate-900 p-4 shadow-sm ring-1 ring-slate-200 dark:ring-slate-800">
-          <p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">File A items</p>
-          <p className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-50">
-            {stats.total.toLocaleString()}
-          </p>
+      <div>
+        <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
+          Claim side — File A ({stats.total.toLocaleString()} rows, statuses sum to the total)
+        </p>
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-6">
+          <div className="rounded-2xl bg-white dark:bg-slate-900 p-4 shadow-sm ring-1 ring-slate-200 dark:ring-slate-800">
+            <p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">File A items</p>
+            <p className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-50">
+              {stats.total.toLocaleString()}
+            </p>
+          </div>
+          {cards.map((c) => (
+            <button
+              key={c.status}
+              onClick={() => {
+                setTab(c.status === "MATCH" ? "audit" : "action");
+              }}
+              className="text-left"
+              title={`Show in ${c.status === "MATCH" ? "Claim Audit" : "Action List"}`}
+            >
+              <StatusCard status={c.status} count={c.count} />
+            </button>
+          ))}
         </div>
-        {cards.map((c) => (
+      </div>
+
+      <div>
+        <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
+          Adjuster side — File B ({bAll.toLocaleString()} rows — the five cards above describe the claim, not this file)
+        </p>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <button
-            key={c.status}
-            onClick={() => {
-              setTab(c.status === "MATCH" ? "audit" : "action");
-            }}
+            onClick={() => setTab("ledger")}
             className="text-left"
-            title={`Show in ${c.status === "MATCH" ? "Full Audit" : "Action List"}`}
+            title="Open the Adjuster Ledger — every File B row listed"
           >
-            <StatusCard status={c.status} count={c.count} />
+            <div className="rounded-2xl bg-white dark:bg-slate-900 p-4 shadow-sm ring-1 ring-slate-200 dark:ring-slate-800 transition hover:ring-indigo-400">
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">Adjuster rows</p>
+              <p className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-50">{bAll.toLocaleString()}</p>
+              <p className="text-[11px] text-slate-400">every row listed in the Adjuster Ledger</p>
+            </div>
           </button>
-        ))}
+          <button
+            onClick={() => setTab("ledger")}
+            className="text-left"
+          >
+            <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 p-4 shadow-sm ring-1 ring-emerald-200 dark:ring-emerald-800 transition hover:ring-emerald-400">
+              <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400">Matched to claim rows</p>
+              <p className="mt-1 text-2xl font-bold text-emerald-800 dark:text-emerald-300">{bMatched.toLocaleString()}</p>
+              <p className="text-[11px] text-emerald-600 dark:text-emerald-500">supports a claim line</p>
+            </div>
+          </button>
+          <button
+            onClick={() => setTab("ledger")}
+            className="text-left"
+          >
+            <div className="rounded-2xl bg-amber-50 dark:bg-amber-950/40 p-4 shadow-sm ring-1 ring-amber-200 dark:ring-amber-800 transition hover:ring-amber-400">
+              <p className="text-xs font-medium text-amber-700 dark:text-amber-400">Unmatched (not in the claim)</p>
+              <p className="mt-1 text-2xl font-bold text-amber-800 dark:text-amber-300">{bUnmatched.toLocaleString()}</p>
+              <p className="text-[11px] text-amber-600 dark:text-amber-500">still listed — never discarded</p>
+            </div>
+          </button>
+        </div>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3">
