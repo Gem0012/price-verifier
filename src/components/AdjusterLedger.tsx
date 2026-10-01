@@ -118,33 +118,6 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
 
   return (
     <div className="space-y-3 pb-10">
-      <div className="grid gap-4 sm:grid-cols-3">
-        <div className="rounded-2xl bg-white dark:bg-slate-900 p-4 shadow-sm ring-1 ring-slate-200 dark:ring-slate-800">
-          <p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-            Adjuster inventory rows
-          </p>
-          <p className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-50">
-            {counts.all.toLocaleString()}
-          </p>
-        </div>
-        <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 p-4 ring-1 ring-emerald-200 dark:ring-emerald-800">
-          <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400">
-            Matched to claim rows
-          </p>
-          <p className="mt-1 text-2xl font-bold text-emerald-800 dark:text-emerald-300">
-            {counts.matched.toLocaleString()}
-          </p>
-        </div>
-        <div className="rounded-2xl bg-amber-50 dark:bg-amber-950/40 p-4 ring-1 ring-amber-200 dark:ring-amber-800">
-          <p className="text-xs font-medium text-amber-700 dark:text-amber-400">
-            Unmatched (not in the claim)
-          </p>
-          <p className="mt-1 text-2xl font-bold text-amber-800 dark:text-amber-300">
-            {counts.unmatched.toLocaleString()}
-          </p>
-        </div>
-      </div>
-
       <p className="rounded-xl bg-white dark:bg-slate-900 px-4 py-2.5 text-sm text-slate-600 dark:text-slate-300 ring-1 ring-slate-200 dark:ring-slate-800">
         Every adjuster row is listed here — nothing is dropped. Inventory total
         (qty × unit price):{" "}
