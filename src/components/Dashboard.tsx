@@ -226,9 +226,11 @@ export default function Dashboard({
             className="text-left"
           >
             <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 p-4 shadow-sm ring-1 ring-emerald-200 dark:ring-emerald-800 transition hover:ring-emerald-400">
-              <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400">Matched to claim rows</p>
+              <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400">Paired with claim rows</p>
               <p className="mt-1 text-2xl font-bold text-emerald-800 dark:text-emerald-300">{bMatched.toLocaleString()}</p>
-              <p className="text-[11px] text-emerald-600 dark:text-emerald-500">supports a claim line</p>
+              <p className="text-[11px] text-emerald-600 dark:text-emerald-500">
+                names paired — {liveCounts.MATCH.toLocaleString()} of them also agree on price
+              </p>
             </div>
           </button>
           <button
@@ -313,7 +315,9 @@ export default function Dashboard({
           onOpen={setDetailId}
         />
       )}
-      {tab === "ledger" && <AdjusterLedger bRowData={bRowData} results={results} />}
+      {tab === "ledger" && (
+        <AdjusterLedger bRowData={bRowData} results={results} onPick={onPick} />
+      )}
       {tab === "action" && (
         <>
           {needsReviewPairs.length > 0 && (
