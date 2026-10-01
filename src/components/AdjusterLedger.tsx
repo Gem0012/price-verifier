@@ -26,6 +26,9 @@ interface LedgerRow {
   matched: boolean;
   matchedARow: number | null;
   matchedAName: string | null;
+  /** Price verdict of the pairing — an attribute, never the ledger status */
+  priceAgreed: boolean | null;
+  diffPct: number | null;
 }
 
 /**
@@ -57,15 +60,31 @@ function findCandidateClaims(
  */
 export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<"all" | "matched" | "unmatched">("all");
+  const [filter, setFilter] = useState<
+    "all" | "paired-agreed" | "paired-differs" | "unmatched"
+  >("all");
   const [page, setPage] = useState(0);
   const [reverseRow, setReverseRow] = useState<LedgerRow | null>(null);
 
   const matchedByB = useMemo(() => {
-    const m = new Map<number, { aRow: number; aName: string }>();
+    // pairing info + the price verdict of the pairing (attribute, not status —
+    // the ledger's own status stays about coverage: paired vs unmatched)
+    const m = new Map<
+      number,
+      { aRow: number; aName: string; priceAgreed: boolean; diffPct: number | null }
+    >();
     for (const r of results) {
       if (r.chosen && !m.has(r.chosen.bRowNum)) {
-        m.set(r.chosen.bRowNum, { aRow: r.aRowNum, aName: r.aRawName });
+        const diffPct =
+          r.difference !== null && r.aPrice !== null && r.aPrice !== 0
+            ? (Math.abs(r.difference) / r.aPrice) * 100
+            : null;
+        m.set(r.chosen.bRowNum, {
+          aRow: r.aRowNum,
+          aName: r.aRawName,
+          priceAgreed: r.status === "MATCH",
+          diffPct,
+        });
       }
     }
     return m;
@@ -84,11 +103,14 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
         matched: !!m,
         matchedARow: m?.aRow ?? null,
         matchedAName: m?.aName ?? null,
+        priceAgreed: m?.priceAgreed ?? null,
+        diffPct: m?.diffPct ?? null,
       };
     });
     const q = query.trim().toLowerCase();
     let list = ledger;
-    if (filter === "matched") list = list.filter((r) => r.matched);
+    if (filter === "paired-agreed") list = list.filter((r) => r.matched && r.priceAgreed);
+    if (filter === "paired-differs") list = list.filter((r) => r.matched && !r.priceAgreed);
     if (filter === "unmatched") list = list.filter((r) => !r.matched);
     if (q) list = list.filter((r) => r.name.toLowerCase().includes(q));
     // Unmatched first (they need attention), then by row number.
@@ -98,9 +120,21 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
   useEffect(() => setPage(0), [query, filter]);
 
   const counts = useMemo(() => {
-    let matched = 0;
-    for (const r of results) if (r.chosen) matched++;
-    return { matched, unmatched: Object.keys(bRowData).length - matched, all: Object.keys(bRowData).length };
+    let agreed = 0;
+    let differs = 0;
+    for (const r of results) {
+      if (!r.chosen) continue;
+      if (r.status === "MISMATCH") differs++;
+      else agreed++;
+    }
+    const matched = agreed + differs;
+    return {
+      agreed,
+      differs,
+      matched,
+      unmatched: Object.keys(bRowData).length - matched,
+      all: Object.keys(bRowData).length,
+    };
   }, [bRowData, results]);
 
   const inventoryTotal = useMemo(
@@ -131,7 +165,7 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
           placeholder="Search adjuster items…"
           className="w-64 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-1.5 text-sm text-slate-900 dark:text-slate-100 outline-none focus:border-indigo-500"
         />
-        {(["all", "matched", "unmatched"] as const).map((f) => (
+        {(["all", "paired-agreed", "paired-differs", "unmatched"] as const).map((f) => (
           <button
             key={f}
             onClick={() => setFilter(f)}
@@ -143,9 +177,11 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
           >
             {f === "all"
               ? `All (${counts.all.toLocaleString()})`
-              : f === "matched"
-                ? `Matched (${counts.matched.toLocaleString()})`
-                : `Unmatched (${counts.unmatched.toLocaleString()})`}
+              : f === "paired-agreed"
+                ? `Paired · price agreed (${counts.agreed.toLocaleString()})`
+                : f === "paired-differs"
+                  ? `Paired · price differs (${counts.differs.toLocaleString()})`
+                  : `Unmatched (${counts.unmatched.toLocaleString()})`}
           </button>
         ))}
         <span className="ml-auto text-xs text-slate-500 dark:text-slate-400">
@@ -198,9 +234,26 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
                 </td>
                 <td className="px-3 py-2">
                   {r.matched ? (
-                    <span className="inline-flex items-center whitespace-nowrap rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800 ring-1 ring-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-300 dark:ring-emerald-800">
-                      Matched → A{r.matchedARow}
-                    </span>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="inline-flex items-center whitespace-nowrap rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-800 ring-1 ring-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-300 dark:ring-emerald-800">
+                        Matched → A{r.matchedARow}
+                      </span>
+                      {r.priceAgreed ? (
+                        <span
+                          className="inline-flex items-center whitespace-nowrap rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                          title="The paired claim row's price agrees (within tolerance)"
+                        >
+                          price ✓
+                        </span>
+                      ) : (
+                        <span
+                          className="inline-flex items-center whitespace-nowrap rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:bg-rose-900/40 dark:text-rose-300"
+                          title={`The paired claim row's price differs${r.diffPct != null ? ` by ±${r.diffPct.toFixed(1)}%` : ""}`}
+                        >
+                          price differs{r.diffPct != null ? ` ±${r.diffPct.toFixed(0)}%` : ""}
+                        </span>
+                      )}
+                    </div>
                   ) : (
                     <div className="flex items-center gap-1.5">
                       <span className="inline-flex items-center whitespace-nowrap rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800 ring-1 ring-amber-200 dark:bg-amber-900/40 dark:text-amber-300 dark:ring-amber-800">
