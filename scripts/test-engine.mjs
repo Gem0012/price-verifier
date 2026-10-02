@@ -169,14 +169,28 @@ check("euro price cleaned + exact match", r9?.status === "STRONG" && r9.aPrice =
 
 {
   // Mixed: one compatible code record + one conflicting → CONFIRMED with a flag.
+  // The costing file carries the code in its structured Part No. column (that
+  // is what makes the match strong identity evidence).
   const a = [{ rowNum: 2, rawName: "BALL JOINT KBJ-1202", rawPrice: 300 }];
   const b = [
-    { rowNum: 2, rawName: "Ball Joint Lower KBJ-1202", rawPrice: 280 },
+    { rowNum: 2, rawName: "Ball Joint Lower KBJ-1202", rawPrice: 280, rawCode: "KBJ-1202" },
     { rowNum: 3, rawName: "Tie Rod End KBJ-1202", rawPrice: 260, rawCode: "KBJ-1202" },
   ];
   const o = runMatching(a, b, DEFAULT_SETTINGS);
   const r = o.results[0];
   check("mixed code evidence → CONFIRMED with conflict note", r.status === "CONFIRMED" && r.candidates.some((c) => c.bRowNum === 2) === true && r.notes.some((n) => n.includes("conflict")), JSON.stringify({ status: r.status, notes: r.notes }));
+}
+
+{
+  // Weak codes: the same code embedded in BOTH descriptions (no Part No.
+  // column anywhere) must NOT confirm identity on its own — "Nail 100mm"
+  // parses as NAIL100MM on both sides of the comparison.
+  const a = [{ rowNum: 2, rawName: "Common Wire Nail 100mm", rawPrice: 50 }];
+  const b = [{ rowNum: 2, rawName: "Wire Nail 100mm", rawPrice: 55 }];
+  const o = runMatching(a, b, DEFAULT_SETTINGS);
+  check("text-only code match never confirms", o.results[0].status === "PROBABLE" && o.results[0].candidates[0]?.matchedCode !== null, `${o.results[0].status} matchedCode=${o.results[0].candidates[0]?.matchedCode}`);
+  // …but it does rank the candidate and surface the code it matched on.
+  check("weak code match still recorded on the candidate", o.results[0].candidates[0]?.matchedCode != null, String(o.results[0].candidates[0]?.matchedCode));
 }
 
 {
@@ -271,7 +285,7 @@ const aRows2 = [
   { rowNum: 6, rawName: "ITM-0003 Pneumatic Cylinder 60mm", rawPrice: 500 },
 ];
 const bRows2 = [
-  { rowNum: 2, rawName: "ITM-0001 Safety Glove Leather", rawPrice: 210 }, // stray code copy
+  { rowNum: 2, rawName: "ITM-0001 Safety Glove Leather", rawPrice: 210, rawCode: "ITM-0001" }, // Part No. column copy
   { rowNum: 3, rawName: "SKU-123 Heavy Duty Safety Gloves", rawPrice: 300 }, // stray code + plural
   { rowNum: 4, rawName: "TOTAL", rawPrice: 0 }, // footer row in B must be ignored
 ];

@@ -42,8 +42,8 @@ export default function PriceSummary({
     let absDiff = 0;
     let pctSum = 0;
     let pctRows = 0;
-    let higher = { count: 0, amount: 0 };
-    let lower = { count: 0, amount: 0 };
+    const higher = { count: 0, amount: 0 };
+    const lower = { count: 0, amount: 0 };
     let equal = 0;
     const byStatus = new Map<Status, { count: number; amountA: number; amountB: number; netDiff: number }>();
     let inRange = 0;

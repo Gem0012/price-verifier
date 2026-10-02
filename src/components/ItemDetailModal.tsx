@@ -161,7 +161,7 @@ export default function ItemDetailModal({
               <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-200">
                 Costing evidence
                 <span className="ml-2 font-normal text-slate-500 dark:text-slate-400">
-                  every record sharing this item's identity — price is evidence, not the verdict
+                  every record sharing this item&apos;s identity — price is evidence, not the verdict
                 </span>
               </h3>
               <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">

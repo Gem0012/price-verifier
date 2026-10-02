@@ -68,7 +68,16 @@ export default function ResultsTable({
   const [gapMode, setGapMode] = useState<"within" | "beyond">("within");
   const searchRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => setPage(0), [query, statusFilter, sortKey, asc, gapPct, gapMode]);
+  // Reset to the first page when the view changes — done during render (the
+  // React-recommended pattern) rather than in an effect.
+  const [viewKey, setViewKey] = useState(
+    `${query}|${statusFilter}|${sortKey}|${asc}|${gapPct}|${gapMode}`,
+  );
+  const nextViewKey = `${query}|${statusFilter}|${sortKey}|${asc}|${gapPct}|${gapMode}`;
+  if (viewKey !== nextViewKey) {
+    setViewKey(nextViewKey);
+    setPage(0);
+  }
 
   // "/" focuses search from anywhere in the table (unless typing in a field).
   useEffect(() => {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import type { Candidate, MatchResult } from "@/lib/types";
 import { extAmount, PAIRING_STATUSES } from "@/lib/analysis";
 import { normalizeDescription, numericSiblingPenaltyTokens, similarity, tokenCounts } from "@/lib/normalize";
@@ -134,7 +134,13 @@ export default function AdjusterLedger({ bRowData, results, onPick }: Props) {
     return list.sort((x, y) => (x.matched === y.matched ? x.rowNum - y.rowNum : x.matched ? 1 : -1));
   }, [bRowData, supportsByB, query, filter]);
 
-  useEffect(() => setPage(0), [query, filter]);
+  // Reset to the first page when the view changes — done during render (the
+  // React-recommended pattern) rather than in an effect.
+  const [viewKey, setViewKey] = useState(`${query}|${filter}`);
+  if (viewKey !== `${query}|${filter}`) {
+    setViewKey(`${query}|${filter}`);
+    setPage(0);
+  }
 
   const counts = useMemo(() => {
     const paired = supportsByB.size;
@@ -386,7 +392,7 @@ function ReverseMatchModal({
         </div>
         <div className="space-y-2 px-5 py-4">
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Closest claim rows by name (confirming one marks that claim row's identity as
+            Closest claim rows by name (confirming one marks that claim row&apos;s identity as
             manually verified):
           </p>
           {candidates.map(({ result, sim }) => {

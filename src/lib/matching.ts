@@ -15,6 +15,7 @@ import {
 import {
   dimsConflict,
   extractIdentity,
+  normalizePartCode,
   wordOverlap,
   type Identity,
 } from "./identity.ts";
@@ -55,6 +56,8 @@ interface BPrep {
   rawPrice: unknown;
   price: number | null;
   identity: Identity;
+  /** Codes that came from the structured code column (strong evidence). */
+  columnCodes: string[];
   grams: { stripped: string; grams: number[] };
   gramSet: Set<number>;
   tokens: Map<string, number>;
@@ -96,6 +99,7 @@ export function runMatching(
   const bPrep: BPrep[] = bRows.map((r) => {
     const rawName = String(r.rawName ?? "").trim();
     const cleaned = normalizeDescription(rawName);
+    const columnCode = normalizePartCode(r.rawCode);
     return {
       rowNum: r.rowNum,
       rawName,
@@ -104,6 +108,7 @@ export function runMatching(
       rawPrice: r.rawPrice,
       price: cleanPrice(r.rawPrice),
       identity: extractIdentity(rawName, r.rawCode),
+      columnCodes: columnCode ? [columnCode] : [],
       grams: numericGrams(cleaned),
       gramSet: numericGramSet(cleaned),
       tokens: tokenCounts(cleaned),
@@ -141,12 +146,18 @@ export function runMatching(
   }
 
   // Part/model code index: normalized code -> B row indices (duplicates kept).
-  const codeIndex = new Map<string, number[]>();
+  // Codes from the structured Part No. column are STRONG identity evidence;
+  // codes merely embedded in the description text are weak (a phrase like
+  // "Nail 100mm" parses as NAIL100MM on both sides of the comparison).
+  const codeIndex = new Map<string, { bi: number; fromColumn: boolean }[]>();
   bPrep.forEach((b, i) => {
     for (const code of b.identity.codes) {
       const arr = codeIndex.get(code);
-      if (arr) arr.push(i);
-      else codeIndex.set(code, [i]);
+      const fromColumn = b.columnCodes.includes(code);
+      const entry = arr?.find((e) => e.bi === i);
+      if (entry) entry.fromColumn = entry.fromColumn || fromColumn;
+      else if (arr) arr.push({ bi: i, fromColumn });
+      else codeIndex.set(code, [{ bi: i, fromColumn }]);
     }
   });
 
@@ -295,6 +306,7 @@ export function runMatching(
     } else {
       const aGrams = gramsFor(aCleaned);
       const accepted = new Map<number, Candidate>(); // bIndex -> candidate
+      const weakCode = new Map<number, Candidate>(); // text-code-only matches
       const conflicts: Candidate[] = []; // code matches with disagreeing descriptions
       let conflictCount = 0;
       let codeConfirmed = false;
@@ -303,13 +315,24 @@ export function runMatching(
       // collected: compatible rows become accepted evidence; conflicting rows
       // stay listed but flagged (a shared part number is evidence even when
       // the wording disagrees — the human decides, nothing is discarded).
+      // A code match is STRONG identity evidence when either side took the
+      // code from a structured Part No. column; when both sides only carry the
+      // code inside their description text the match is kept as a weak signal
+      // (phrases like "Nail 100mm" parse as NAIL100MM on both sides) and can
+      // raise the candidate's rank but never confirm identity on its own.
+      const aColumnCodes = new Set<string>();
+      {
+        const col = normalizePartCode(row.rawCode);
+        if (col) aColumnCodes.add(col);
+      }
       if (aIdentity.codes.length > 0) {
         const seen = new Set<number>();
         for (const code of aIdentity.codes) {
-          for (const bi of codeIndex.get(code) ?? []) {
+          for (const { bi, fromColumn } of codeIndex.get(code) ?? []) {
             if (seen.has(bi)) continue;
             seen.add(bi);
             const b = bPrep[bi];
+            const strong = fromColumn || aColumnCodes.has(code);
             const overlap = wordOverlap(aIdentity.words, b.identity.words);
             if (overlap < CONFLICT_OVERLAP) {
               conflictCount++;
@@ -332,8 +355,7 @@ export function runMatching(
                 `Part number ${code} matches B${b.rowNum} but dimensions differ (${aIdentity.dims.join(", ")} vs ${b.identity.dims.join(", ")}) — verify size.`,
               );
             }
-            codeConfirmed = true;
-            accepted.set(bi, {
+            const cand: Candidate = {
               bRowNum: b.rowNum,
               rawName: b.rawName,
               cleaned: b.cleaned,
@@ -341,14 +363,19 @@ export function runMatching(
               price: b.price,
               similarity: scoreB(aGrams, bi),
               matchedCode: code,
-            });
+            };
+            if (strong) {
+              codeConfirmed = true;
+              accepted.set(bi, cand);
+            } else {
+              weakCode.set(bi, cand);
+            }
           }
         }
       }
 
-      // Stage 1 — exact match on the normalized cleaned description. When an
-      // exact name exists it is strong evidence even if a conflicting code row
-      // was reported above (the conflict note stays).
+      // Stage 1 — exact match on the normalized cleaned description. Weak
+      // text-code matches do not block it: an exact description outranks them.
       if (accepted.size === 0 && conflicts.length === 0) {
         const exactIdx = byClean.get(aCleaned);
         if (exactIdx) {
@@ -361,8 +388,9 @@ export function runMatching(
               rawPrice: b.rawPrice,
               price: b.price,
               similarity: 100,
-              matchedCode: null,
+              matchedCode: weakCode.get(bi)?.matchedCode ?? null,
             });
+            weakCode.delete(bi);
           }
         }
       }
@@ -383,19 +411,22 @@ export function runMatching(
             rawPrice: b.rawPrice,
             price: b.price,
             similarity: sim,
-            matchedCode: null,
+            matchedCode: weakCode.get(bi)?.matchedCode ?? null,
           });
+          weakCode.delete(bi);
         }
       }
 
       // Candidates: compatible evidence first (best score wins the reference
-      // slot), conflicting rows after — listed for review, never chosen.
+      // slot), then weak text-code matches (rank boost only), conflicting rows
+      // last — listed for review, never chosen.
       const acceptedList = [...accepted.values()].sort((x, y) => y.similarity - x.similarity);
+      const weakList = [...weakCode.values()].sort((x, y) => y.similarity - x.similarity);
       const conflictList = conflicts.sort((x, y) => y.similarity - x.similarity);
-      candidates = [...acceptedList, ...conflictList];
-      const top = acceptedList[0] ?? null;
+      candidates = [...acceptedList, ...weakList, ...conflictList];
+      const top = acceptedList[0] ?? weakList[0] ?? null;
 
-      if (acceptedList.length === 0 && conflictCount > 0) {
+      if (acceptedList.length === 0 && weakList.length === 0 && conflictCount > 0) {
         // Every code hit conflicts — flag for the insured, accept nothing.
         status = "CONFLICT";
         notes.push(
@@ -414,16 +445,16 @@ export function runMatching(
           );
         }
         notes.unshift(`Identity by part number: ${aIdentity.codes.join(", ")}.`);
-      } else if (acceptedList.length === 0) {
+      } else if (!top) {
         status = "UNMATCHED";
-      } else if (top!.similarity >= 100) {
+      } else if (top.similarity >= 100) {
         status = "STRONG";
         method = "exact";
       } else {
         status = "PROBABLE";
         method = "fuzzy";
         notes.push(
-          `Best name similarity ${top!.similarity} — fuzzy evidence only, confirm manually or with Jev.`,
+          `Best name similarity ${top.similarity} — fuzzy evidence only, confirm manually or with Jev.`,
         );
       }
 
